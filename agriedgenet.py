@@ -2,10 +2,23 @@
 AgriEdgeNet — a sub-1M-parameter multi-task CNN for real-time crop/weed semantic
 segmentation on a drone-mounted NVIDIA Jetson.
 
+Target platform
+---------------
+  Sensor : Parrot Sequoia — four global-shutter monochrome bands, 1280x960 each
+           Green 550/40, Red 660/40, RedEdge 735/10, NIR 790/40 nm, ~1 Hz capture
+  Compute: NVIDIA Jetson Nano  -> use agriedgenet_s()
+           NVIDIA Jetson Orin Nano -> use agriedgenet_m()  (primary)
+
+Because the Sequoia captures at ~1 Hz, the network can be run at full native
+band resolution (1280x960) rather than downscaled: ~2.91 GMACs for the S variant
+and ~9.70 GMACs for the M variant, against a 1000 ms per-frame budget. Native
+resolution is the right use of that headroom because small-target detectability
+is set by ground sample distance, not by model capacity.
+
 Design targets
 --------------
-  * < 1,000,000 parameters  (M variant: 874,744 verified)
-  * 4-band input (Green, Red, RedEdge, NIR) or 3-band RGB
+  * < 1,000,000 parameters  (M variant: 874,750 verified)
+  * 4-band input in Sequoia channel order (Green, Red, RedEdge, NIR)
   * Semantic segmentation head  (crop type / weed / soil / background)
   * Tile-level anomaly head     (drives adaptive waypoint / ground-truth sampling)
   * Vegetation indices are NOT learned — they are computed arithmetically from
@@ -243,9 +256,16 @@ def agriedgenet_m(in_ch=4, num_classes=6):
 # --------------------------------------------------------------------------- #
 
 def vegetation_indices(reflectance, eps=1e-6):
-    """reflectance: B x 4 x H x W, band order (Green, Red, RedEdge, NIR),
-    already converted from DN to reflectance using the downwelling light sensor
-    and reflectance-panel calibration."""
+    """reflectance: B x 4 x H x W in Parrot Sequoia band order
+    (Green 550, Red 660, RedEdge 735, NIR 790).
+
+    IMPORTANT: the input must already be (a) band co-registered, since the
+    Sequoia's four bands come from four separate lenses and are spatially
+    offset, and (b) converted from raw digital numbers to reflectance using the
+    Sequoia irradiance sensor plus reflectance-panel calibration. Indices
+    computed on raw DN are not comparable across a flight, let alone between
+    flights.
+    """
     g, r, _re, nir = (reflectance[:, i:i + 1] for i in range(4))
     ndvi = (nir - r) / (nir + r + eps)
     # MSAVI2 — best chlorophyll correlate reported in the reviewed literature
