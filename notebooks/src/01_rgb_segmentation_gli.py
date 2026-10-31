@@ -75,7 +75,7 @@ YOLO_CONF_SWEEP = [0.05, 0.1, 0.25, 0.4]                    # chosen on valid, t
 # Footprint = H * sensor / focal = 30.26 m x 22.70 m; native GSD = 9.2 mm/px. The GSD of each dataset image is the
 # footprint divided by that image's own width/height (valid only if Roboflow resized whole frames, not crops/tiles).
 CAMERA = {'sensor_w_mm': 3.68, 'sensor_h_mm': 2.76, 'focal_mm': 3.04, 'native_px': (3280, 2464), 'height_agl_m': 25.0}
-IMAGES_ARE_FULL_FRAMES = True      # set False if Roboflow cropped/tiled frames: area is then meaningless
+IMAGES_ARE_FULL_FRAMES = True      # Option A: Roboflow v4 'Resize 640x640' of full frames in every split
 MIN_PATCH_FRACTION = 0.002         # connected regions smaller than this share of the image are ignored
 
 # GLI (illustrative, NOT validated)
@@ -131,6 +131,7 @@ def dataset_yaml_abs(root):
 def dataset_summary(root):
     names = load_names(root)
     print('classes:', names)
+    all_sizes = {}
     for split in ('train', 'valid', 'test'):
         d = find_split_dir(root, split)
         imgs = sorted(p for p in (d / 'images').iterdir() if p.suffix.lower() in IMG_EXT)
@@ -139,6 +140,16 @@ def dataset_summary(root):
             h, w = cv2.imread(str(p)).shape[:2]
             sizes[f'{w}x{h}'] = sizes.get(f'{w}x{h}', 0) + 1
         print(f'{split:5s}: {len(imgs):4d} images, sizes {sizes}')
+        all_sizes.update(sizes)
+    # Option A: every split = full camera frame resized to one size, so train and test share the same GSD
+    if len(all_sizes) != 1:
+        print(f'WARNING: image sizes differ across/within splits {sorted(all_sizes)}: train and test GSD differ '
+              '(crops or mixed preprocessing). Area per pixel below is only right for resized full frames.')
+    else:
+        w, h = map(int, next(iter(all_sizes)).split('x'))
+        fw, fh = (CAMERA['height_agl_m'] * CAMERA[k] / CAMERA['focal_mm'] for k in ('sensor_w_mm', 'sensor_h_mm'))
+        print(f'all splits {w}x{h}: GSD {100 * fw / w:.2f} x {100 * fh / h:.2f} cm/px '
+              f'(native {1000 * fw / CAMERA["native_px"][0]:.2f} mm/px, {fw / w / (fw / CAMERA["native_px"][0]):.2f}x coarser)')
     return names
 
 
