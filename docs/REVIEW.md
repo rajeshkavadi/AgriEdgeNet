@@ -108,10 +108,8 @@ cameras, no georeference, different scenes). Two routes would give per-crop NDVI
 
 **Claim as stated.** A CNN with < 50,000 parameters segments the five crops better than existing models.
 
-**What is built.** `agriseg/agrisegnet.py` now has `AgriSegNetNano` (`--arch nano`): 33,142 parameters (6 classes),
-0.25 GMACs at 640x640, ReLU6/BN/depthwise only, LR-ASPP-style global gate, dilated 1/16 stage. Its ONNX graph
-is Conv, Clip, Add, Mul, ReduceMean, Resize and Sigmoid. It learns the synthetic set (test mIoU 0.77 after 40
-epochs). The existing AgriSegNet width-scaled to 0.25 is 43,894 parameters and makes the natural second
+**What is built.** `agriseg/agrisegnet.py` now has `AgriSegNetNano` (`--arch nano`); see section 7 for the
+current, device-agnostic version (34,742 parameters, 0.25 GMACs at 640x640). The existing AgriSegNet width-scaled to 0.25 is 43,894 parameters and makes the natural second
 candidate, because width scaling was the winning strategy in Menshchikov et al. For scale: YOLO11n-seg is 2.87M
 parameters and 9.8 GFLOPs; YOLO26n-seg is the same class.
 
@@ -191,3 +189,41 @@ python agriseg/evaluate.py --data <export> --split test --imgsz 640 \
 * Only 1 of the 4 Sequoia captures, so flight-median fallback was exercised only trivially.
 * The repo's `agriedgenet.py` (874k parameters, 4-band, multitask) conflicts with the new 50k target. It is left
   untouched until you decide which direction to keep.
+
+## 7. Round 2 (device-agnostic target, custom CNN in notebook 1, 12 Sequoia images)
+
+**Requirement as clarified:** one model for any device (MCU, Raspberry Pi, Jetson Nano/Orin), light enough to share
+the device with other scheduled tasks; it replaces YOLO26 in notebook 1.
+
+**Model changes.** `AgriSegNetNano` was redesigned for operator portability, not just size:
+* The dilated convolutions are gone (microcontroller kernels support dilation unevenly). Receptive field now
+  comes from a 1/32 stage plus a global-average-pool gate.
+* Upsampling uses fixed x2/x8 factors, so the exported graph is static. It contains only Conv, Add, Mul, Clip,
+  GlobalAveragePool, Sigmoid and Resize; no Shape, Slice or Concat ops.
+* There is an optional 1/8-resolution output (`--output-stride 8`) for hosts that upsample the label map themselves.
+
+| | params | GMACs @640 | peak INT8 activations @256 / 320 / 640 |
+|---|---|---|---|
+| nano w=0.5 | 11,390 | 0.10 | 0.38 / 0.60 / 2.38 MiB |
+| nano w=1.0 (default) | 34,742 | 0.25 | 0.44 / 0.68 / 2.73 MiB |
+
+**What decides the device is the input size, not the parameter count.** At 640 px the input and first layer
+alone need more than 2 MiB, which is beyond most microcontrollers. At 256 to 320 px the model fits in under
+0.7 MiB. Notebook 1 therefore evaluates at the training size and at 320 px, and exports both. If 320 px costs
+too much accuracy on your data, tile the frame rather than widen the model.
+
+**Notebook 1 now:** downloads the Roboflow train/valid/test export, reports image sizes, checks for split leakage,
+trains nano, scores test mIoU at two input sizes (with YOLO26 as an optional baseline if its weights are present),
+exports FP32 and INT8 ONNX and scores those too, then runs the GLI and area analysis on connected regions of the
+custom model's label map. On the synthetic set the INT8 graph's mIoU stayed within ~1 point of FP32 (it came out
+0.9 to 1.3 points *higher*, which is noise); measure the drop on your data.
+
+**Indices on all 12 images.** All four captures register with consistent transforms. Centre shift relative to REG:
+NIR (-18.9, +3.2 to +3.5) px, RED (-12.3 to -12.5, +22.9 to +23.3) px; maximum deviation from the flight median
+1.6 px. That is what a rigid rig should produce, so the flight-median fallback was not triggered. Median NDVI is
+0.55 to 0.66 and median NDRE 0.03 to 0.08. NDRE > NDVI on at most 0.21 % of vegetation pixels in any capture.
+
+**Still open.** I have not trained on your Roboflow data (the key must not be used from here), so there is no real
+accuracy number yet. For any reported result, run 3 seeds and a field/date-held-out split. The MCU path
+(ONNX -> TFLite-Micro) is not automated, and the repo's `agriedgenet.py` (874k params, 4-band) is not used by
+this pipeline.

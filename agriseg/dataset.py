@@ -170,6 +170,17 @@ class CropSegDataset(Dataset):
         return to_tensor(img), torch.from_numpy(mask.astype(np.int64))
 
 
+def preprocess(img_rgb: np.ndarray, imgsz: int, pad_mult: int = PAD_MULT):
+    """Aspect-preserving resize (long side = imgsz), reflect-pad bottom/right to a multiple of pad_mult.
+    Returns (CHW float tensor, (valid_h, valid_w)). Used for evaluation AND deployment, so both see the same input."""
+    h, w = img_rgb.shape[:2]
+    s = imgsz / max(h, w)
+    nh, nw = max(32, round(h * s)), max(32, round(w * s))
+    small = cv2.resize(img_rgb, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+    small = cv2.copyMakeBorder(small, 0, (-nh) % pad_mult, 0, (-nw) % pad_mult, cv2.BORDER_REFLECT_101)
+    return to_tensor(small), (nh, nw)
+
+
 class CropSegEval(Dataset):
     """Evaluation dataset: aspect-preserving resize (long side = imgsz), pad to a multiple of 128.
     Returns the ORIGINAL-resolution mask so every model is scored at the same resolution."""
@@ -190,12 +201,8 @@ class CropSegEval(Dataset):
         img = cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
         gt = rasterize(parse_label_file(self.label_dir / (p.stem + ".txt")), h, w)
-        s = self.imgsz / max(h, w)
-        nh, nw = max(32, round(h * s)), max(32, round(w * s))
-        small = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
-        ph, pw = (-nh) % PAD_MULT, (-nw) % PAD_MULT
-        small = cv2.copyMakeBorder(small, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
-        return {"image": to_tensor(small), "gt": torch.from_numpy(gt.astype(np.int64)),
+        x, (nh, nw) = preprocess(img, self.imgsz)
+        return {"image": x, "gt": torch.from_numpy(gt.astype(np.int64)),
                 "valid_hw": (nh, nw), "path": str(p), "rgb": img}
 
 

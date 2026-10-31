@@ -198,45 +198,51 @@ def count_flops(model: nn.Module, imgsz=(512, 512), device="cpu") -> float:
 
 
 # ----------------------------------------------------------------------------- sub-50k variant
-class DilatedDW(nn.Module):
-    """Residual depthwise-separable block with a dilated 3x3 depthwise conv: grows the receptive
-    field at 1/16 for ~2.5k parameters instead of adding a 1/32 stage (~12k)."""
+class DWBlock(nn.Module):
+    """Depthwise 3x3 + pointwise 1x1, residual when shapes match. Stride 2 downsamples."""
 
-    def __init__(self, ch, dilation):
+    def __init__(self, cin, cout, s=1):
         super().__init__()
-        self.dw = nn.Sequential(nn.Conv2d(ch, ch, 3, 1, dilation, dilation=dilation, groups=ch, bias=False),
-                                nn.BatchNorm2d(ch), nn.ReLU6(inplace=True))
-        self.pw = ConvBNAct(ch, ch, 1, 1, act=False)
+        self.use_res = s == 1 and cin == cout
+        self.dw = ConvBNAct(cin, cin, 3, s, groups=cin)
+        self.pw = ConvBNAct(cin, cout, 1, 1, act=not self.use_res)
 
     def forward(self, x):
-        return x + self.pw(self.dw(x))
+        y = self.pw(self.dw(x))
+        return x + y if self.use_res else y
 
 
 class AgriSegNetNano(nn.Module):
-    """< 50k-parameter semantic segmentation network (crop-type mapping from UAV RGB).
+    """Device-agnostic < 50k-parameter semantic segmentation network (crop-type mapping, UAV RGB).
 
-    Budget logic: crop-type regions are large and colour/texture driven, so capacity goes to receptive
-    field (dilated 1/16 stage + global-context gate) rather than to channels; prediction at 1/8.
-    Head is LR-ASPP style (MobileNetV3): global average pool -> sigmoid gate on 1/16 features, fused
-    with a 1/8 skip. GlobalAveragePool exports cleanly to ONNX at any input size divisible by 16.
-    ReLU6 / BN / depthwise only -> INT8- and NPU-friendly.
+    Operator set (after BN folding): Conv (dense + depthwise, no dilation), Add, Mul, Clip (ReLU6),
+    GlobalAveragePool, Sigmoid, Resize (bilinear, integer factors). These map to TensorRT, ONNX Runtime,
+    TFLite / TFLite-Micro, OpenVINO and most NPUs; nothing dynamic, no dilation, no attention.
+
+    Capacity goes to receptive field (stages down to 1/32 + a global-context gate) rather than channels:
+    crop-type regions are large and colour/texture driven. Prediction at 1/8.
+
+    `output_stride=8` in forward() skips the final upsample: the deployed graph then emits logits at 1/8
+    resolution (argmax there, nearest-upsample the label map on the host). At 640 px this removes the
+    largest activation in the network (640*640*num_classes).
     """
 
     def __init__(self, num_classes: int, width: float = 1.0, aux: bool = True, drop: float = 0.05):
         super().__init__()
         self.num_classes, self.use_aux = num_classes, aux
+        self.output_stride = 1
         c0, c1, c2, c3 = (_c(c, width) for c in (16, 24, 32, 48))
-        self.stem = ConvBNAct(3, c0, 3, 2)                                            # 1/2
-        self.down4 = nn.Sequential(ConvBNAct(c0, c0, 3, 2, groups=c0), ConvBNAct(c0, c1, 1, 1))  # 1/4
-        self.stage4 = InvertedResidual(c1, c1, 1, 2, 3)
-        self.stage8 = nn.Sequential(InvertedResidual(c1, c2, 2, 2, 3),                 # 1/8
+        self.stem = ConvBNAct(3, c0, 3, 2)                                    # 1/2
+        self.stage4 = nn.Sequential(DWBlock(c0, c1, 2), InvertedResidual(c1, c1, 1, 2, 3))   # 1/4
+        self.stage8 = nn.Sequential(InvertedResidual(c1, c2, 2, 2, 3),         # 1/8
                                     InvertedResidual(c2, c2, 1, 2, 3))
-        self.stage16 = nn.Sequential(InvertedResidual(c2, c3, 2, 2, 3),                # 1/16
-                                     DilatedDW(c3, 2), DilatedDW(c3, 4), DilatedDW(c3, 8))
-        self.ctx_feat = ConvBNAct(c3, c2, 1, 1)
-        self.ctx_gate = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(c3, c2, 1), nn.Sigmoid())
+        self.stage16 = nn.Sequential(InvertedResidual(c2, c3, 2, 2, 3), DWBlock(c3, c3))   # 1/16
+        self.stage32 = nn.Sequential(DWBlock(c3, c3, 2), DWBlock(c3, c3))      # 1/32
+        self.ctx16 = ConvBNAct(c3, c2, 1, 1)
+        self.ctx32 = ConvBNAct(c3, c2, 1, 1, act=False)
+        self.gate = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(c3, c2, 1), nn.Sigmoid())
         self.low = ConvBNAct(c2, c2, 1, 1, act=False)
-        self.refine = DWSep(c2, c2)
+        self.refine = DWBlock(c2, c2)
         self.drop = nn.Dropout2d(drop)
         self.head = nn.Conv2d(c2, num_classes, 1)
         self.aux_head = nn.Conv2d(c3, num_classes, 1) if aux else None
@@ -247,17 +253,37 @@ class AgriSegNetNano(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        H, W = x.shape[-2:]
-        f8 = self.stage8(self.stage4(self.down4(self.stem(x))))
+        # input H, W must be divisible by 32; fixed integer scale factors keep the exported graph static
+        # (no Shape/Slice/Concat ops), which microcontroller and NPU compilers require
+        f8 = self.stage8(self.stage4(self.stem(x)))
         f16 = self.stage16(f8)
-        ctx = self.ctx_feat(f16) * self.ctx_gate(f16)
-        ctx = F.interpolate(ctx, size=f8.shape[-2:], mode="bilinear", align_corners=False)
-        out = self.head(self.drop(self.refine(ctx + self.low(f8))))
-        out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
+        f32 = self.stage32(f16)
+        up = lambda t, k: F.interpolate(t, scale_factor=k, mode="bilinear", align_corners=False)
+        ctx = self.ctx16(f16) * self.gate(f32) + up(self.ctx32(f32), 2)
+        out = self.head(self.drop(self.refine(up(ctx, 2) + self.low(f8))))
+        if self.output_stride == 1:
+            out = up(out, 8)
         if self.training and self.use_aux:
-            aux = F.interpolate(self.aux_head(f16), size=(H, W), mode="bilinear", align_corners=False)
-            return {"out": out, "aux": aux}
+            return {"out": out, "aux": up(self.aux_head(f16), 16)}
         return out
+
+
+def peak_activation_bytes(model: nn.Module, imgsz=(640, 640), bytes_per_value=1) -> int:
+    """Largest (input + output) of any conv, plus the final upsample if present. BN and activations are
+    folded or in-place at deployment, so they are not counted. A lower bound on the runtime arena size."""
+    peak = [0]
+
+    def hook(_m, inp, out):
+        peak[0] = max(peak[0], out.numel() + inp[0].numel())
+
+    hs = [m.register_forward_hook(hook) for m in model.modules() if isinstance(m, nn.Conv2d)]
+    with torch.no_grad():
+        out = model.eval()(torch.zeros(1, 3, *imgsz))
+    for h in hs:
+        h.remove()
+    if getattr(model, "output_stride", 1) == 1:      # final bilinear upsample: 1/8 logits -> full res
+        peak[0] = max(peak[0], out.numel() + out.numel() // 64)
+    return peak[0] * bytes_per_value
 
 
 ARCHS = {"agrisegnet": AgriSegNet, "nano": AgriSegNetNano}
@@ -271,9 +297,12 @@ def build_model(arch: str, num_classes: int, width: float = 1.0, depth: int = 1,
 
 
 if __name__ == "__main__":
-    for arch, w, d in [("nano", 0.75, 1), ("nano", 1.0, 1), ("nano", 1.25, 1),
-                       ("agrisegnet", 0.25, 1), ("agrisegnet", 0.5, 1), ("agrisegnet", 1.0, 1)]:
-        m = build_model(arch, num_classes=6, width=w, depth=d)
-        n = count_params(m)
-        print(f"{arch:<10s} width={w:<4} depth={d}  params={n:>9,d}  "
-              f"{'<50k' if n < 50_000 else '    '}  GMACs@640={count_flops(m, (640, 640)):6.3f}")
+    print(f"{'arch':<11}{'width':>6}{'params':>10}{'GMACs@640':>11}   peak INT8 activations (MiB) @256 / 320 / 640")
+    for arch, w in [("nano", 0.5), ("nano", 0.75), ("nano", 1.0), ("agrisegnet", 0.25), ("agrisegnet", 1.0)]:
+        m = build_model(arch, num_classes=6, width=w, aux=False)
+        acts = [peak_activation_bytes(m, (s, s)) / 2 ** 20 for s in (256, 320, 640)]
+        line = f"{arch:<11}{w:>6}{count_params(m):>10,d}{count_flops(m, (640, 640)):>11.3f}   " + " / ".join(f"{a:.2f}" for a in acts)
+        if arch == "nano":
+            m.output_stride = 8
+            line += "   | stride-8 output @640: %.2f" % (peak_activation_bytes(m, (640, 640)) / 2 ** 20)
+        print(line)

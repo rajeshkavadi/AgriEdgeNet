@@ -13,12 +13,21 @@ not the paths inside `data.yaml`, so Roboflow's `../train/images` quirk does not
     python agrisegnet.py
 Prints params and GMACs@640 for both architectures (6 classes):
 
-| arch | width | params | GMACs @640 |
-|---|---|---|---|
-| nano (`AgriSegNetNano`) | 0.75 | 23,790 | 0.22 |
-| nano | 1.0 | 33,142 | 0.25 |
-| agrisegnet | 0.25 | 43,894 | 0.12 |
-| agrisegnet | 1.0 | 491,102 | 0.83 |
+| arch | width | params | GMACs @640 | peak INT8 activations @256 / 320 / 640 px |
+|---|---|---|---|---|
+| nano (`AgriSegNetNano`) | 0.5 | 11,390 | 0.10 | 0.38 / 0.60 / 2.38 MiB |
+| nano | 1.0 | 34,742 | 0.25 | 0.44 / 0.68 / 2.73 MiB |
+| agrisegnet | 0.25 | 43,894 | 0.12 | 0.38 / 0.60 / 2.38 MiB |
+| agrisegnet | 1.0 | 491,102 | 0.83 | 0.44 / 0.68 / 2.73 MiB |
+
+Nano is device-agnostic: its exported graph is static and uses only Conv (dense/depthwise, no dilation), Add, Mul,
+Clip, GlobalAveragePool, Sigmoid and Resize (fixed x2/x8). Input sides must be multiples of 32.
+
+## 1b. Deployment check (ONNX FP32 + INT8, accuracy of the exported graphs)
+    python onnx_tools.py --ckpt runs/nano_w1_s0/best.pt --data /path/to/export --imgsz 640 --out deploy
+    python onnx_tools.py --ckpt runs/nano_w1_s0/best.pt --data /path/to/export --imgsz 320 --out deploy/mcu_320
+Writes FP32 and QDQ-INT8 ONNX (TensorRT / ONNX Runtime / OpenVINO) and their test mIoU. For microcontrollers,
+convert the FP32 ONNX to TFLite INT8 (onnx2tf) with the same calibration images; not automated here.
 
 `--arch nano` enforces a 50k budget, `--arch agrisegnet` 1M (override with `--max-params`).
 At 640 px peak activations (~3 MiB INT8) dwarf the weights (32 KiB for nano): parameters are not the

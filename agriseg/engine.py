@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from agrisegnet import build_model
-from dataset import CropSegEval, eval_collate
+from dataset import CropSegEval, eval_collate, preprocess
 from metrics import ConfusionMatrix
 
 
@@ -34,6 +34,18 @@ def predict_semantic(model, batch, device, amp=False, tta=False) -> np.ndarray:
             logits = logits + model(x.flip(3)).float().softmax(1).flip(3)
             logits = logits + model(x.flip(2)).float().softmax(1).flip(2)
     logits = logits[:, :, :nh, :nw]
+    logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
+    return logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
+
+
+@torch.no_grad()
+def predict_image(model, img_rgb, imgsz, device=torch.device("cpu")) -> np.ndarray:
+    """Label map (0=bg, c+1) at the image's own resolution, for any RGB image."""
+    x, (nh, nw) = preprocess(img_rgb, imgsz)
+    logits = model(x.unsqueeze(0).to(device)).float()
+    logits = logits[:, :, :nh, :nw] if logits.shape[-2:] == x.shape[-2:] else \
+        F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)[:, :, :nh, :nw]
+    h, w = img_rgb.shape[:2]
     logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
     return logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
 

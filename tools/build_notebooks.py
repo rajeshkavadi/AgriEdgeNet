@@ -29,13 +29,30 @@ def parse(path):
             cells.append((kind, text))
 
     for line in Path(path).read_text().splitlines():
-        if line.startswith('# %%'):
+        if line.startswith('# %% [agriseg]'):
+            flush()
+            cells.extend(agriseg_cells())
+            kind, buf = None, []
+        elif line.startswith('# %%'):
             flush()
             kind, buf = ('markdown' if '[markdown]' in line else 'code'), []
         else:
             buf.append(line)
     flush()
     return cells
+
+
+AGRISEG_FILES = ['agrisegnet.py', 'dataset.py', 'metrics.py', 'engine.py', 'train.py', 'evaluate.py', 'onnx_tools.py']
+
+
+def agriseg_cells():
+    """Embed the agriseg package so the notebook is self-contained in Colab (files written to /content/agriseg)."""
+    out = [('markdown', '## agriseg package\nWritten to `/content/agriseg` by the cells below '
+                        '(generated from the repo; edit the repo, not these cells).'),
+           ('code', '!mkdir -p /content/agriseg')]
+    for f in AGRISEG_FILES:
+        out.append(('code', f'%%writefile /content/agriseg/{f}\n' + (ROOT / 'agriseg' / f).read_text().rstrip('\n')))
+    return out
 
 
 def notebook(cells):
