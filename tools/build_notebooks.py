@@ -72,7 +72,14 @@ def notebook(cells):
 
 COMBINED_HEAD = """# Consolidated pipeline: RGB crop segmentation + Sequoia NDVI / NDRE
 
-Part 1 is `01_rgb_segmentation_gli` and part 2 is `02_sequoia_alignment_indices`, unchanged and run back to back.
+Part 1 (`01_rgb_segmentation_gli`) reads the **RGB dataset from Roboflow**, trains the lightweight CNN (AgriSegNet-Nano)
+and compares it with YOLO26n-seg. Part 2 (`02_sequoia_alignment_indices`) reads the **12 Sequoia TIFs (4 captures x
+NIR/RED/REG) from Google Drive**, calibrates and aligns them, and computes NDVI and NDRE. Results are saved to
+`MyDrive/AgriEdgeNet_Results` and zipped at the end.
+
+Before running: (1) Runtime -> Change runtime type -> GPU; (2) add the Colab Secret `ROBOFLOW_API_KEY` or fill
+`ROBOFLOW_API_KEY` in the configuration cell; (3) make sure `MyDrive/parrot 12 images` exists (add a shortcut if the
+folder was shared with you).
 
 **What this notebook does not do:** it does not compute NDVI or NDRE per segmented crop patch. That needs the
 RGB masks and the Sequoia bands on one shared pixel grid, which the current data cannot provide:
@@ -90,7 +97,8 @@ bundle = Path('/content/Combined_Results') if IN_COLAB else Path('Combined_Resul
 bundle.mkdir(exist_ok=True)
 for src, name in ((RESULTS, 'Segmentation'), (SEQ_OUT_ROOT, 'Sequoia_Indices')):
     if Path(src).exists():
-        shutil.copytree(src, bundle / name, dirs_exist_ok=True)
+        shutil.copytree(src, bundle / name, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('*.pt', '*.cache', 'runs', 'yolo'))   # weights stay on Drive
 archive = shutil.make_archive(str(bundle), 'zip', bundle)
 print('archive:', archive)
 if IN_COLAB:

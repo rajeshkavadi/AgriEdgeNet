@@ -227,3 +227,19 @@ NIR (-18.9, +3.2 to +3.5) px, RED (-12.3 to -12.5, +22.9 to +23.3) px; maximum d
 accuracy number yet. For any reported result, run 3 seeds and a field/date-held-out split. The MCU path
 (ONNX -> TFLite-Micro) is not automated, and the repo's `agriedgenet.py` (874k params, 4-band) is not used by
 this pipeline.
+
+## 8. Round 3: YOLO26n-seg baselines
+
+Notebook 1 trains two YOLO26n-seg baselines on the same Roboflow split, input size, epochs and seed as Nano:
+
+| Baseline | Init | Why |
+|---|---|---|
+| `yolo26n_coco` | `yolo26n-seg.pt` (COCO-pretrained) | What a practitioner would deploy: the practical bar |
+| `yolo26n_scratch` | `yolo26n-seg.yaml` (random) | Same starting point as Nano: isolates architecture and size |
+
+YOLO26n-seg has 3,126,280 parameters (2.70M fused) and 10.6 GFLOPs at 640 px, against Nano's 34,742 and ~0.5 GFLOPs.
+ImageNet initialisation is not offered: Ultralytics seg weights are COCO-pretrained, and Nano has no pretrained
+weights at all. The YOLO instance masks are converted to semantic maps, with the confidence threshold chosen on
+valid and then fixed for test. Reported per pair: test mIoU, per-class IoU, a paired-bootstrap 95 % CI, and native
+mask mAP for reference. Expect COCO-pretrained YOLO to win on small datasets; the claim to test is how much accuracy
+Nano gives up for about 90x fewer parameters, at which input size.

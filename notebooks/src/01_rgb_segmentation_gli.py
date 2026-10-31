@@ -7,9 +7,14 @@
 # integer factors. It is static, with no Shape/Slice ops, so it runs on TensorRT (Jetson Nano/Orin), ONNX Runtime
 # (Raspberry Pi), OpenVINO, NPUs and, via TFLite-Micro, microcontrollers.
 #
-# Flow: Roboflow export (train/valid/test, YOLO polygon labels) -> semantic masks -> train -> test mIoU at two input
-# sizes -> ONNX FP32 + INT8 with accuracy check -> per-patch area and GLI on the test images.
-# YOLO26-seg is kept only as an optional baseline (`YOLO_WEIGHTS`).
+# Flow: Roboflow export (train/valid/test, YOLO polygon labels) -> semantic masks -> train AgriSegNet-Nano ->
+# train two YOLO26n-seg baselines on the same split (COCO-pretrained and from scratch) -> pick YOLO's confidence
+# threshold on **valid** -> compare all models on **test** (mIoU, per-class IoU, paired bootstrap CI, params, GFLOPs)
+# -> ONNX FP32 + INT8 with accuracy check -> per-patch area and GLI on the test images.
+#
+# **Why two YOLO baselines.** `yolo26n-seg` (COCO-pretrained) is what a practitioner would deploy; it is the
+# practical bar. `yolo26n-seg` from scratch has the same starting point as Nano (no pretraining) and isolates
+# architecture and size. Nano has no pretrained weights, so the pretrained comparison is deliberately unequal.
 #
 # **On devices the binding limit is activation memory, not parameters.** INT8 peak activations are about 2.7 MiB at
 # 640 px but 0.44 MiB at 256 px. For microcontrollers, run at 256 to 320 px; the evaluation below reports
@@ -35,16 +40,23 @@ import yaml
 import torch
 
 ROOT = Path('/content') if Path('/content').exists() else Path.cwd()
+if IN_COLAB:                       # results (incl. trained checkpoints) go to Drive so a disconnect loses nothing
+    from google.colab import drive
+    drive.mount('/content/drive')
+RESULTS_ROOT = Path('/content/drive/MyDrive/AgriEdgeNet_Results') if IN_COLAB else ROOT / 'Results'
 AGRISEG_DIR = Path(os.environ.get('AGRISEG_DIR', str(ROOT / 'agriseg')))
 
 # %% [agriseg]
 
 # %%
 # ---------------------------------------------------------------- configuration
-# Roboflow export (YOLO segmentation format: train / valid / test with polygon labels)
+# Roboflow export (YOLO segmentation format: train / valid / test with polygon labels).
+# Key: preferably a Colab Secret named ROBOFLOW_API_KEY (key icon, left sidebar). You may paste it below instead,
+# but then do not share this notebook: anyone with the file can use your Roboflow account.
+ROBOFLOW_API_KEY = ''
 RF_WORKSPACE, RF_PROJECT, RF_VERSION, RF_FORMAT = 'kavadis-workspace', 'crop_classification_orin', 4, 'yolo26'
 DATASET_DIR = Path(os.environ.get('SEG_DATASET', str(ROOT / f'{RF_PROJECT}-{RF_VERSION}')))
-RESULTS = Path(os.environ.get('SEG_OUT', str(ROOT / 'Results' / 'Segmentation')))
+RESULTS = Path(os.environ.get('SEG_OUT', str(RESULTS_ROOT / 'Segmentation')))
 
 # Model and training
 ARCH, WIDTH = 'nano', 1.0          # nano: 34.7k params (width 0.5 -> 11.4k). 'agrisegnet' width 0.25 -> 43.9k
@@ -53,7 +65,12 @@ EPOCHS = int(os.environ.get('SEG_EPOCHS', 150))
 BATCH = 16
 SEEDS = [0]                        # use [0, 1, 2] for any reported number (mean +/- std)
 EVAL_SIZES = [TRAIN_IMGSZ, 320]    # 320 = microcontroller-class input
-YOLO_WEIGHTS = ROOT / 'v4_best_epoch78.pt'   # optional baseline; skipped if the file is absent
+
+# YOLO26 baselines: trained here on the same split, same imgsz and epochs
+YOLO_BASELINES = {'yolo26n_coco': 'yolo26n-seg.pt',        # COCO-pretrained (Ultralytics release weights)
+                  'yolo26n_scratch': 'yolo26n-seg.yaml'}   # random init, same architecture
+YOLO_CONF_SWEEP = [0.05, 0.1, 0.25, 0.4]                    # chosen on valid, then fixed for test
+EXISTING_YOLO = ROOT / 'v4_best_epoch78.pt'                 # your earlier weights: evaluated too if uploaded
 
 # Ground scale (Raspberry Pi Camera v2 / IMX219 values from the old notebook; replace with the real camera and AGL)
 CAMERA = {'sensor_w_mm': 3.68, 'sensor_h_mm': 2.76, 'focal_mm': 3.04, 'height_agl_m': 20.0}
@@ -87,16 +104,27 @@ def run(cmd):
 def download_dataset():
     if (DATASET_DIR / 'data.yaml').is_file():
         return DATASET_DIR
-    key = os.environ.get('ROBOFLOW_API_KEY')
+    key = ROBOFLOW_API_KEY or os.environ.get('ROBOFLOW_API_KEY')
     if not key and IN_COLAB:
         from google.colab import userdata
         key = userdata.get('ROBOFLOW_API_KEY')
     if not key:
-        raise RuntimeError('Set ROBOFLOW_API_KEY in Colab Secrets (key icon, left sidebar).')
+        raise RuntimeError('No Roboflow key: add the Colab Secret ROBOFLOW_API_KEY or fill ROBOFLOW_API_KEY above.')
     from roboflow import Roboflow
     ds = Roboflow(api_key=key).workspace(RF_WORKSPACE).project(RF_PROJECT).version(RF_VERSION).download(
         RF_FORMAT, location=str(DATASET_DIR))
     return Path(ds.location)
+
+
+def dataset_yaml_abs(root):
+    """Roboflow's data.yaml uses '../train/images'; Ultralytics needs paths it can resolve. Writes data_abs.yaml."""
+    names = load_names(root)
+    cfg = {'path': str(Path(root).resolve()), 'names': dict(enumerate(names))}
+    for key, split in (('train', 'train'), ('val', 'valid'), ('test', 'test')):
+        cfg[key] = str(find_split_dir(root, split).relative_to(root) / 'images')
+    out = Path(root) / 'data_abs.yaml'
+    yaml.safe_dump(cfg, open(out, 'w'), sort_keys=False)
+    return out
 
 
 def dataset_summary(root):
@@ -131,6 +159,7 @@ def leakage_report(root, max_hamming=6):
 
 
 ds_root = download_dataset()
+data_yaml = dataset_yaml_abs(ds_root)
 class_names = dataset_summary(ds_root)
 leakage_report(ds_root)
 
@@ -152,21 +181,61 @@ for seed in SEEDS:
     ckpts.append(out / 'best.pt')
 
 # %%
-# ---------------------------------------------------------------- evaluate on the held-out test split
+# ---------------------------------------------------------------- YOLO26n-seg baselines (same split, imgsz, epochs)
+from ultralytics import YOLO
+
+yolo_ckpts = {}
+for tag, init in YOLO_BASELINES.items():
+    y = YOLO(init)
+    y.train(data=str(data_yaml), imgsz=TRAIN_IMGSZ, epochs=EPOCHS, batch=BATCH, seed=SEEDS[0],
+            pretrained=init.endswith('.pt'), project=str(RESULTS / 'yolo'), name=tag, exist_ok=True,
+            plots=False, device=0 if torch.cuda.is_available() else 'cpu', workers=2)
+    yolo_ckpts[tag] = RESULTS / 'yolo' / tag / 'weights' / 'best.pt'
+if EXISTING_YOLO.is_file():
+    yolo_ckpts['existing_v4'] = EXISTING_YOLO
+
+# native instance metrics (mask mAP) on test, for reference
+yolo_native = {}
+for tag, w in yolo_ckpts.items():
+    m = YOLO(str(w)).val(data=str(data_yaml), split='test', imgsz=TRAIN_IMGSZ, plots=False, verbose=False)
+    yolo_native[tag] = {'mask_mAP50': float(m.seg.map50), 'mask_mAP50_95': float(m.seg.map)}
+print(json.dumps(yolo_native, indent=2))
+
+# %%
+# ---------------------------------------------------------------- YOLO confidence threshold: chosen on VALID only
+yolo_conf = {}
+for tag, w in yolo_ckpts.items():
+    out = RESULTS / 'yolo_conf_on_valid' / tag
+    run(['evaluate.py', '--data', ds_root, '--split', 'valid', '--imgsz', TRAIN_IMGSZ, '--yolo', w,
+         '--yolo-conf', *YOLO_CONF_SWEEP, '--no-bench', '--viz', 0, '--out', out])
+    rows = json.load(open(out / 'results.json'))['rows']
+    best = max(rows, key=lambda r: r['mIoU_crops'])
+    yolo_conf[tag] = float(best['model'].rsplit('@conf', 1)[1])
+    print(f'{tag}: conf {yolo_conf[tag]} (valid mIoU crops {best["mIoU_crops"]:.4f})')
+
+# %%
+# ---------------------------------------------------------------- comparison on the held-out TEST split
 eval_results = {}
-for s in EVAL_SIZES:
-    out = RESULTS / f'eval_test_{s}'
-    cmd = ['evaluate.py', '--data', ds_root, '--split', 'test', '--imgsz', s, '--custom', *ckpts,
-           '--viz', 4 if s == TRAIN_IMGSZ else 0, '--out', out]
-    if YOLO_WEIGHTS.is_file() and s == TRAIN_IMGSZ:
-        # YOLO's conf threshold should be chosen on the valid split first (see agriseg/README.md)
-        cmd += ['--yolo', YOLO_WEIGHTS, '--yolo-conf', 0.25]
-    run(cmd)
-    eval_results[s] = json.load(open(out / 'results.json'))
-for s, r in eval_results.items():
+for tag, w in yolo_ckpts.items():
+    out = RESULTS / 'compare_test' / tag
+    run(['evaluate.py', '--data', ds_root, '--split', 'test', '--imgsz', TRAIN_IMGSZ, '--custom', *ckpts,
+         '--yolo', w, '--yolo-conf', yolo_conf[tag], '--viz', 6, '--out', out])
+    eval_results[f'{TRAIN_IMGSZ}px vs {tag}'] = json.load(open(out / 'results.json'))
+for s in EVAL_SIZES[1:]:          # Nano at a microcontroller-class input size
+    out = RESULTS / f'nano_test_{s}'
+    run(['evaluate.py', '--data', ds_root, '--split', 'test', '--imgsz', s, '--custom', *ckpts, '--viz', 0, '--out', out])
+    eval_results[f'{s}px nano only'] = json.load(open(out / 'results.json'))
+
+print(f"\n{'setting':<28}{'model':<26}{'params':>11}{'GFLOPs':>8}{'mIoU crops':>12}{'pix acc':>9}")
+for k, r in eval_results.items():
     for row in r['rows']:
-        print(f"@{s:4d}px {row['model']:<28s} params {row.get('params', 0):>10,}  mIoU(crops) {row['mIoU_crops']:.4f}  "
-              f"pixel acc {row['pixel_acc']:.4f}")
+        print(f"{k:<28}{row['model']:<26}{(row.get('params') or 0):>11,}{(row.get('gflops') or 0):>8.2f}"
+              f"{row['mIoU_crops']:>12.4f}{row['pixel_acc']:>9.4f}")
+    for pair, (m, lo, hi) in r.get('paired_bootstrap_mIoU_crops(mean,lo95,hi95)', {}).items():
+        verdict = 'Nano better' if lo > 0 else 'YOLO better' if hi < 0 else 'no significant difference'
+        print(f"   {pair}: dmIoU {m:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}] -> {verdict}")
+json.dump({'yolo_native_test': yolo_native, 'yolo_conf_from_valid': yolo_conf,
+           'comparison': eval_results}, open(RESULTS / 'comparison_summary.json', 'w'), indent=2)
 
 # %%
 # ---------------------------------------------------------------- export: ONNX FP32 + INT8, accuracy of the exported graphs
@@ -264,9 +333,9 @@ def run_patch_analysis(ckpt, image_dir, out_dir=RESULTS, imgsz=TRAIN_IMGSZ):
         f.write(f'AgriSegNet-Nano crop segmentation report\n{"=" * 70}\n')
         f.write(f'checkpoint {ckpt} | arch {ck["cfg"].get("arch")} | width {ck["cfg"]["width"]} | imgsz {imgsz}\n')
         f.write(f'camera {CAMERA} | full frames: {IMAGES_ARE_FULL_FRAMES}\n')
-        for s, r in eval_results.items():
+        for k, r in eval_results.items():
             for row in r['rows']:
-                f.write(f"test @{s}px {row['model']}: mIoU(crops) {row['mIoU_crops']:.4f}, per class {row['per_class_iou']}\n")
+                f.write(f"test {k} | {row['model']}: mIoU(crops) {row['mIoU_crops']:.4f}, per class {row['per_class_iou']}\n")
         f.write('Condition and yield are INDICATIVE (unvalidated thresholds and factors).\n\n')
         for name in sorted({r['class'] for r in rows}):
             rr = [r for r in rows if r['class'] == name]

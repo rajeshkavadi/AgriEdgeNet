@@ -58,8 +58,12 @@ warnings.filterwarnings('ignore', category=rasterio.errors.NotGeoreferencedWarni
 
 # %%
 # ---------------------------------------------------------------- configuration
+# The 12 TIFs (4 captures x NIR/RED/REG). A folder that was *shared with you* is not under MyDrive until you
+# right-click it in Drive -> Organize -> Add shortcut -> My Drive. Then this path works.
 SEQ_IMAGE_FOLDER = Path(os.environ.get('SEQUOIA_DIR', '/content/drive/MyDrive/parrot 12 images'))
-SEQ_OUT_ROOT = Path(os.environ.get('SEQUOIA_OUT', str(SEQ_IMAGE_FOLDER / 'Calibrated_Aligned_Indices')))
+# Outputs go to your own Drive (writing into someone else's shared folder can fail on permissions)
+SEQ_OUT_ROOT = Path(os.environ.get('SEQUOIA_OUT', '/content/drive/MyDrive/AgriEdgeNet_Results/Sequoia_Indices'))
+SEQ_EXPECTED_CAPTURES = 4
 
 SEQ_BAND_SUFFIXES = {'GRE': ['GRE'], 'RED': ['RED'], 'REG': ['REG'], 'NIR': ['NIR']}
 SEQ_BAND_ORDER = ['GRE', 'RED', 'REG', 'NIR']
@@ -332,6 +336,9 @@ def calibrate(files):
 def run_sequoia_pipeline(folder=None, out_root=None):
     folder = Path(folder or SEQ_IMAGE_FOLDER)
     out_root = Path(out_root or SEQ_OUT_ROOT)
+    if not folder.is_dir():
+        raise FileNotFoundError(f'{folder} not found. If the folder was shared with you, add a shortcut to '
+                                'My Drive (Drive -> right-click -> Organize -> Add shortcut), or set SEQ_IMAGE_FOLDER.')
     dirs = {k: out_root / k for k in ('Calibrated_Bands', 'NDVI', 'NDRE', 'Alignment_QC')}
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
@@ -341,6 +348,10 @@ def run_sequoia_pipeline(folder=None, out_root=None):
     if not sets:
         raise FileNotFoundError(f'No Sequoia capture sets with a {SEQ_REFERENCE_BAND} band in {folder}')
     print(f'{len(sets)} capture set(s) in {folder}')
+    for k, v in sets.items():
+        print(f'  {k}: {sorted(v)}')
+    if len(sets) != SEQ_EXPECTED_CAPTURES:
+        print(f'  WARNING: expected {SEQ_EXPECTED_CAPTURES} captures, found {len(sets)}')
 
     # ---- pass 1: radiometry and per-capture registration
     cap = {}
