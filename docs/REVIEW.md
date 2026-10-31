@@ -228,18 +228,23 @@ accuracy number yet. For any reported result, run 3 seeds and a field/date-held-
 (ONNX -> TFLite-Micro) is not automated, and the repo's `agriedgenet.py` (874k params, 4-band) is not used by
 this pipeline.
 
-## 8. Round 3: YOLO26n-seg baselines
+## 8. Round 3: baseline, early stopping, deployment benchmark, GSD
 
-Notebook 1 trains two YOLO26n-seg baselines on the same Roboflow split, input size, epochs and seed as Nano:
-
-| Baseline | Init | Why |
-|---|---|---|
-| `yolo26n_coco` | `yolo26n-seg.pt` (COCO-pretrained) | What a practitioner would deploy: the practical bar |
-| `yolo26n_scratch` | `yolo26n-seg.yaml` (random) | Same starting point as Nano: isolates architecture and size |
-
-YOLO26n-seg has 3,126,280 parameters (2.70M fused) and 10.6 GFLOPs at 640 px, against Nano's 34,742 and ~0.5 GFLOPs.
-ImageNet initialisation is not offered: Ultralytics seg weights are COCO-pretrained, and Nano has no pretrained
-weights at all. The YOLO instance masks are converted to semantic maps, with the confidence threshold chosen on
-valid and then fixed for test. Reported per pair: test mIoU, per-class IoU, a paired-bootstrap 95 % CI, and native
-mask mAP for reference. Expect COCO-pretrained YOLO to win on small datasets; the claim to test is how much accuracy
-Nano gives up for about 90x fewer parameters, at which input size.
+* **Baseline:** YOLO26n-seg **from scratch** (`yolo26n-seg.yaml`) only, matching Nano (no pretraining). It has 3.13M
+  parameters and 10.6 GFLOPs at 640, against Nano's 34.7k. Both are trained on the same Roboflow split, input size,
+  epoch cap (300) and seed.
+* **Early stopping on valid**, patience 50 for both. Nano stops on valid mIoU (crops); Ultralytics stops on its own
+  fitness (0.1 mAP50 + 0.9 mAP50-95). The criteria differ because the models' native outputs differ. A patience of 5
+  stopped Nano at epoch 6 on a noisy early peak, hence 50.
+* **Deployment benchmark (`agriseg/benchmark.py`):** both models are exported to static ONNX at 640, 480 and 320 px,
+  in FP32 and INT8. INT8 uses the same recipe for both: ORT static QDQ, per-channel, Conv/MatMul, the same
+  calibration images. Both are scored on test with ONNX Runtime; YOLO's confidence threshold comes from valid.
+  Reported: mIoU (crops), per-class IoU, paired-bootstrap CI (Nano - YOLO) per size x precision, ONNX size, and CPU
+  latency (1 thread). Checked: YOLO26n ONNX FP32 masks match PyTorch exactly (IoU 1.0); INT8 agrees at 0.987.
+  **INT8 latency on ORT-CPU is not representative** (emulated and slower than FP32); INT8 speed must be measured on the
+  target runtime.
+* **GSD:** Pi Camera v2 (IMX219, 3.68 x 2.76 mm sensor, 3.04 mm lens, 3280 x 2464) at 25 m gives a 30.26 x 22.70 m
+  footprint and 9.23 mm/px native GSD; a 640 x 640 (stretched) frame gives 4.73 x 3.55 cm/px and 16.8 cm2/px. Each
+  overlay shows the GSD and per-class area in a header, and area (m2) and GLI on every patch. This is valid only if
+  Roboflow resized whole frames; if it cropped or tiled them, set `IMAGES_ARE_FULL_FRAMES = False`. Area assumes flat
+  ground, nadir view and a constant 25 m AGL: a 1 m height error is about 8 % in area.

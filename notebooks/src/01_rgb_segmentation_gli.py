@@ -7,18 +7,17 @@
 # integer factors. It is static, with no Shape/Slice ops, so it runs on TensorRT (Jetson Nano/Orin), ONNX Runtime
 # (Raspberry Pi), OpenVINO, NPUs and, via TFLite-Micro, microcontrollers.
 #
-# Flow: Roboflow export (train/valid/test, YOLO polygon labels) -> semantic masks -> train AgriSegNet-Nano ->
-# train two YOLO26n-seg baselines on the same split (COCO-pretrained and from scratch) -> pick YOLO's confidence
-# threshold on **valid** -> compare all models on **test** (mIoU, per-class IoU, paired bootstrap CI, params, GFLOPs)
-# -> ONNX FP32 + INT8 with accuracy check -> per-patch area and GLI on the test images.
+# Flow: Roboflow export (train/valid/test, YOLO polygon labels) -> semantic masks -> train AgriSegNet-Nano and the
+# YOLO26n-seg baseline, both **from scratch**, same split / input size / epoch budget, both with **early stopping on
+# the valid split** -> YOLO's confidence threshold chosen on valid -> **deployment benchmark on test**: both models
+# exported to ONNX at 640 / 480 / 320 px, each in FP32 and INT8 (same quantisation recipe), scored with ONNX Runtime
+# (mIoU, per-class IoU, paired bootstrap CI, size, CPU latency) -> per-patch area (m2) and GLI drawn on the test images.
 #
-# **Why two YOLO baselines.** `yolo26n-seg` (COCO-pretrained) is what a practitioner would deploy; it is the
-# practical bar. `yolo26n-seg` from scratch has the same starting point as Nano (no pretraining) and isolates
-# architecture and size. Nano has no pretrained weights, so the pretrained comparison is deliberately unequal.
+# **Baseline.** YOLO26n-seg (3.13M params, 10.6 GFLOPs @640), the smallest YOLO26 segmentation model, trained from random
+# initialisation like Nano (34.7k params), so the comparison isolates architecture and size, not pretraining.
 #
 # **On devices the binding limit is activation memory, not parameters.** INT8 peak activations are about 2.7 MiB at
-# 640 px but 0.44 MiB at 256 px. For microcontrollers, run at 256 to 320 px; the evaluation below reports
-# the accuracy cost of doing so.
+# 640 px but 0.44 MiB at 256 px. The resolution sweep below shows the accuracy cost of smaller inputs.
 #
 # Fixes carried over from the review (`docs/REVIEW.md`): the API key comes from Colab Secrets (**rotate the old
 # leaked key**); GSD is computed per image; GLI is reported over vegetation pixels; yield is labelled indicative;
@@ -58,23 +57,25 @@ RF_WORKSPACE, RF_PROJECT, RF_VERSION, RF_FORMAT = 'kavadis-workspace', 'crop_cla
 DATASET_DIR = Path(os.environ.get('SEG_DATASET', str(ROOT / f'{RF_PROJECT}-{RF_VERSION}')))
 RESULTS = Path(os.environ.get('SEG_OUT', str(RESULTS_ROOT / 'Segmentation')))
 
-# Model and training
-ARCH, WIDTH = 'nano', 1.0          # nano: 34.7k params (width 0.5 -> 11.4k). 'agrisegnet' width 0.25 -> 43.9k
+# Model and training (same budget for Nano and YOLO)
+ARCH, WIDTH = 'nano', 1.0          # nano: 34.7k params (width 0.5 -> 11.4k)
 TRAIN_IMGSZ = int(os.environ.get('SEG_IMGSZ', 640))
-EPOCHS = int(os.environ.get('SEG_EPOCHS', 150))
+EPOCHS = int(os.environ.get('SEG_EPOCHS', 300))      # upper bound; early stopping ends training sooner
+PATIENCE = int(os.environ.get('SEG_PATIENCE', 50))   # stop after this many epochs without val improvement (from-scratch starts slowly)
 BATCH = 16
 SEEDS = [0]                        # use [0, 1, 2] for any reported number (mean +/- std)
-EVAL_SIZES = [TRAIN_IMGSZ, 320]    # 320 = microcontroller-class input
+EVAL_SIZES = [int(x) for x in os.environ.get('SEG_EVAL_SIZES', '640 480 320').split()]   # multiples of 32
+CALIB_IMAGES = 100                 # training images used to calibrate INT8 (same set for both models)
 
-# YOLO26 baselines: trained here on the same split, same imgsz and epochs
-YOLO_BASELINES = {'yolo26n_coco': 'yolo26n-seg.pt',        # COCO-pretrained (Ultralytics release weights)
-                  'yolo26n_scratch': 'yolo26n-seg.yaml'}   # random init, same architecture
+# Baseline: YOLO26n-seg from scratch (random init), like Nano
+YOLO_BASELINES = {'yolo26n_scratch': 'yolo26n-seg.yaml'}
 YOLO_CONF_SWEEP = [0.05, 0.1, 0.25, 0.4]                    # chosen on valid, then fixed for test
-EXISTING_YOLO = ROOT / 'v4_best_epoch78.pt'                 # your earlier weights: evaluated too if uploaded
 
-# Ground scale (Raspberry Pi Camera v2 / IMX219 values from the old notebook; replace with the real camera and AGL)
-CAMERA = {'sensor_w_mm': 3.68, 'sensor_h_mm': 2.76, 'focal_mm': 3.04, 'height_agl_m': 20.0}
-IMAGES_ARE_FULL_FRAMES = True      # False if Roboflow cropped/tiled frames: area is then meaningless
+# Ground scale: Raspberry Pi Camera v2 (Sony IMX219, 8 MP, 3280 x 2464, 1.12 um pixels), flown at 25 m AGL.
+# Footprint = H * sensor / focal = 30.26 m x 22.70 m; native GSD = 9.2 mm/px. The GSD of each dataset image is the
+# footprint divided by that image's own width/height (valid only if Roboflow resized whole frames, not crops/tiles).
+CAMERA = {'sensor_w_mm': 3.68, 'sensor_h_mm': 2.76, 'focal_mm': 3.04, 'native_px': (3280, 2464), 'height_agl_m': 25.0}
+IMAGES_ARE_FULL_FRAMES = True      # set False if Roboflow cropped/tiled frames: area is then meaningless
 MIN_PATCH_FRACTION = 0.002         # connected regions smaller than this share of the image are ignored
 
 # GLI (illustrative, NOT validated)
@@ -171,28 +172,27 @@ for s in sorted({256, 320, TRAIN_IMGSZ}):
     print(f'  peak INT8 activations @ {s}px: {peak_activation_bytes(_m, (s, s)) / 2**20:.2f} MiB')
 
 # %%
-# ---------------------------------------------------------------- train
+# ---------------------------------------------------------------- train AgriSegNet-Nano (early stopping on valid mIoU)
 RUNS = RESULTS / 'runs'
 ckpts = []
 for seed in SEEDS:
     out = RUNS / f'{ARCH}_w{WIDTH}_s{seed}'
     run(['train.py', '--data', ds_root, '--arch', ARCH, '--width', WIDTH, '--imgsz', TRAIN_IMGSZ,
-         '--epochs', EPOCHS, '--bs', BATCH, '--seed', seed, '--workers', 2, '--out', out])
+         '--epochs', EPOCHS, '--patience', PATIENCE, '--bs', BATCH, '--seed', seed, '--workers', 2, '--out', out])
     ckpts.append(out / 'best.pt')
+    print(json.load(open(out / 'summary.json'))['best_epoch'], 'best epoch of', json.load(open(out / 'summary.json'))['epochs_run'])
 
 # %%
-# ---------------------------------------------------------------- YOLO26n-seg baselines (same split, imgsz, epochs)
+# ---------------------------------------------------------------- train YOLO26n-seg from scratch (early stopping on valid)
 from ultralytics import YOLO
 
 yolo_ckpts = {}
 for tag, init in YOLO_BASELINES.items():
-    y = YOLO(init)
-    y.train(data=str(data_yaml), imgsz=TRAIN_IMGSZ, epochs=EPOCHS, batch=BATCH, seed=SEEDS[0],
-            pretrained=init.endswith('.pt'), project=str(RESULTS / 'yolo'), name=tag, exist_ok=True,
-            plots=False, device=0 if torch.cuda.is_available() else 'cpu', workers=2)
+    YOLO(init).train(data=str(data_yaml), imgsz=TRAIN_IMGSZ, epochs=EPOCHS, patience=PATIENCE, batch=BATCH,
+                     seed=SEEDS[0], pretrained=False, project=str(RESULTS / 'yolo'), name=tag, exist_ok=True,
+                     plots=False, device=0 if torch.cuda.is_available() else 'cpu', workers=2)
     yolo_ckpts[tag] = RESULTS / 'yolo' / tag / 'weights' / 'best.pt'
-if EXISTING_YOLO.is_file():
-    yolo_ckpts['existing_v4'] = EXISTING_YOLO
+# Ultralytics stops on its own fitness (0.1 mAP50 + 0.9 mAP50-95 on valid); Nano stops on valid mIoU.
 
 # native instance metrics (mask mAP) on test, for reference
 yolo_native = {}
@@ -214,44 +214,53 @@ for tag, w in yolo_ckpts.items():
     print(f'{tag}: conf {yolo_conf[tag]} (valid mIoU crops {best["mIoU_crops"]:.4f})')
 
 # %%
-# ---------------------------------------------------------------- comparison on the held-out TEST split
-eval_results = {}
+# ---------------------------------------------------------------- qualitative test montages (PyTorch, training size)
+# image | ground truth | Nano | YOLO, saved as viz_*.jpg
 for tag, w in yolo_ckpts.items():
-    out = RESULTS / 'compare_test' / tag
     run(['evaluate.py', '--data', ds_root, '--split', 'test', '--imgsz', TRAIN_IMGSZ, '--custom', *ckpts,
-         '--yolo', w, '--yolo-conf', yolo_conf[tag], '--viz', 6, '--out', out])
-    eval_results[f'{TRAIN_IMGSZ}px vs {tag}'] = json.load(open(out / 'results.json'))
-for s in EVAL_SIZES[1:]:          # Nano at a microcontroller-class input size
-    out = RESULTS / f'nano_test_{s}'
-    run(['evaluate.py', '--data', ds_root, '--split', 'test', '--imgsz', s, '--custom', *ckpts, '--viz', 0, '--out', out])
-    eval_results[f'{s}px nano only'] = json.load(open(out / 'results.json'))
-
-print(f"\n{'setting':<28}{'model':<26}{'params':>11}{'GFLOPs':>8}{'mIoU crops':>12}{'pix acc':>9}")
-for k, r in eval_results.items():
-    for row in r['rows']:
-        print(f"{k:<28}{row['model']:<26}{(row.get('params') or 0):>11,}{(row.get('gflops') or 0):>8.2f}"
-              f"{row['mIoU_crops']:>12.4f}{row['pixel_acc']:>9.4f}")
-    for pair, (m, lo, hi) in r.get('paired_bootstrap_mIoU_crops(mean,lo95,hi95)', {}).items():
-        verdict = 'Nano better' if lo > 0 else 'YOLO better' if hi < 0 else 'no significant difference'
-        print(f"   {pair}: dmIoU {m:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}] -> {verdict}")
-json.dump({'yolo_native_test': yolo_native, 'yolo_conf_from_valid': yolo_conf,
-           'comparison': eval_results}, open(RESULTS / 'comparison_summary.json', 'w'), indent=2)
+         '--yolo', w, '--yolo-conf', yolo_conf[tag], '--viz', 8, '--out', RESULTS / 'montages_test' / tag])
 
 # %%
-# ---------------------------------------------------------------- export: ONNX FP32 + INT8, accuracy of the exported graphs
-DEPLOY = RESULTS / 'deploy'
-run(['onnx_tools.py', '--ckpt', ckpts[0], '--data', ds_root, '--imgsz', TRAIN_IMGSZ, '--split', 'test', '--out', DEPLOY])
-run(['onnx_tools.py', '--ckpt', ckpts[0], '--data', ds_root, '--imgsz', 320, '--split', 'test', '--out', DEPLOY / 'mcu_320'])
+# ---------------------------------------------------------------- deployment benchmark on TEST: {640, 480, 320} x {FP32, INT8}
+# Both models are exported to static ONNX at each size, INT8-quantised with the same recipe (ORT static QDQ, per-channel,
+# Conv/MatMul, calibrated on the same training images) and scored with ONNX Runtime.
+# CPU latency is ORT on the Colab CPU, 1 thread, graph only. INT8 latency on ORT-CPU is NOT representative (INT8 is
+# emulated there and often slower); measure INT8 speed on the target (TensorRT on Jetson, TFLite on Pi/MCU).
+BENCH = RESULTS / 'benchmark_test'
+run(['benchmark.py', '--data', ds_root, '--split', 'test', '--sizes', *EVAL_SIZES, '--custom', *ckpts,
+     '--yolo', *yolo_ckpts.values(), '--yolo-conf', *[yolo_conf[t] for t in yolo_ckpts],
+     '--calib', CALIB_IMAGES, '--threads', 1, '--out', BENCH])
+bench = json.load(open(BENCH / 'benchmark.json'))
+for pair, (m, lo, hi) in bench['paired_bootstrap_mIoU_crops(mean,lo95,hi95)'].items():
+    verdict = 'Nano better' if lo > 0 else 'YOLO better' if hi < 0 else 'no significant difference'
+    print(f'{pair}: dmIoU {m:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}] -> {verdict}')
+json.dump({'yolo_native_test': yolo_native, 'yolo_conf_from_valid': yolo_conf, 'benchmark': bench},
+          open(RESULTS / 'comparison_summary.json', 'w'), indent=2)
 
 
 # %%
 # ---------------------------------------------------------------- per-patch area and GLI from the custom model
+def gsd_m(img_w, img_h):
+    """Ground sample distance (m/px) along x and y for a full camera frame resized to img_w x img_h."""
+    fw = CAMERA['height_agl_m'] * CAMERA['sensor_w_mm'] / CAMERA['focal_mm']
+    fh = CAMERA['height_agl_m'] * CAMERA['sensor_h_mm'] / CAMERA['focal_mm']
+    return fw / img_w, fh / img_h
+
+
 def area_per_pixel_m2(img_w, img_h):
     if not IMAGES_ARE_FULL_FRAMES:
         return float('nan')
-    fw = CAMERA['height_agl_m'] * CAMERA['sensor_w_mm'] / CAMERA['focal_mm']
-    fh = CAMERA['height_agl_m'] * CAMERA['sensor_h_mm'] / CAMERA['focal_mm']
-    return (fw / img_w) * (fh / img_h)
+    gx, gy = gsd_m(img_w, img_h)
+    return gx * gy
+
+
+_fw, _fh = gsd_m(1, 1)
+print(f"footprint {_fw:.2f} m x {_fh:.2f} m at {CAMERA['height_agl_m']} m AGL; native GSD "
+      f"{1000 * _fw / CAMERA['native_px'][0]:.2f} mm/px")
+for _w, _h in ((640, 640), (640, 480)):
+    _gx, _gy = gsd_m(_w, _h)
+    print(f'  {_w}x{_h} image: GSD {100 * _gx:.2f} x {100 * _gy:.2f} cm/px, {1e4 * _gx * _gy:.1f} cm2 per pixel'
+          + ('  (stretched 4:3 -> 1:1: anisotropic but area is still correct)' if _w == _h else ''))
 
 
 def gli_map(bgr):
@@ -312,7 +321,17 @@ def analyse_image(path, label_map, names):
             vis[own] = (vis[own].astype(np.float32) * 0.55 + col * 0.45).astype(np.uint8)
             draw_label(vis, f'#{len(rows)} {name} A:{area:.1f}m2 GLI:{gli_all:.2f}',
                        int(cent[k][0]), int(cent[k][1]), placed)
-    return vis, rows
+    # header: GSD and per-class totals for this image
+    gx, gy = gsd_m(w, h)
+    tot = {}
+    for r in rows:
+        tot[r['class']] = tot.get(r['class'], 0.0) + r['area_m2']
+    lines = [f'GSD {100 * gx:.2f}x{100 * gy:.2f} cm/px @ {CAMERA["height_agl_m"]:.0f} m',
+             '  '.join(f'{k}: {v:.1f} m2' for k, v in sorted(tot.items())) or 'no crop patches']
+    bar = np.zeros((22 * len(lines) + 6, w, 3), np.uint8)
+    for i, t in enumerate(lines):
+        cv2.putText(bar, t, (6, 20 + 22 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    return np.vstack([bar, vis]), rows
 
 
 def run_patch_analysis(ckpt, image_dir, out_dir=RESULTS, imgsz=TRAIN_IMGSZ):
@@ -332,10 +351,14 @@ def run_patch_analysis(ckpt, image_dir, out_dir=RESULTS, imgsz=TRAIN_IMGSZ):
     with open(out_dir / 'SEGMENTATION_REPORT.txt', 'w') as f:
         f.write(f'AgriSegNet-Nano crop segmentation report\n{"=" * 70}\n')
         f.write(f'checkpoint {ckpt} | arch {ck["cfg"].get("arch")} | width {ck["cfg"]["width"]} | imgsz {imgsz}\n')
-        f.write(f'camera {CAMERA} | full frames: {IMAGES_ARE_FULL_FRAMES}\n')
-        for k, r in eval_results.items():
-            for row in r['rows']:
-                f.write(f"test {k} | {row['model']}: mIoU(crops) {row['mIoU_crops']:.4f}, per class {row['per_class_iou']}\n")
+        f.write(f'camera {CAMERA} | full frames: {IMAGES_ARE_FULL_FRAMES}\n\n')
+        f.write('Deployment benchmark on test (ONNX Runtime):\n')
+        for r in sorted(bench['rows'], key=lambda r: (-r['size'], r['precision'], r['kind'], r['model'])):
+            f.write(f"  {r['size']:>4}px {r['precision']} {r['model']:<26} params {r['params']:>10,}  "
+                    f"mIoU(crops) {r['mIoU_crops']:.4f}  per class {r['per_class_iou']}\n")
+        for pair, (m, lo, hi) in bench['paired_bootstrap_mIoU_crops(mean,lo95,hi95)'].items():
+            f.write(f'  {pair}: dmIoU {m:+.4f} [{lo:+.4f}, {hi:+.4f}]\n')
+        f.write('\n')
         f.write('Condition and yield are INDICATIVE (unvalidated thresholds and factors).\n\n')
         for name in sorted({r['class'] for r in rows}):
             rr = [r for r in rows if r['class'] == name]
@@ -347,3 +370,10 @@ def run_patch_analysis(ckpt, image_dir, out_dir=RESULTS, imgsz=TRAIN_IMGSZ):
 
 
 seg_rows = run_patch_analysis(ckpts[0], find_split_dir(ds_root, 'test') / 'images')
+
+# %%
+# ---------------------------------------------------------------- show segmented test images (area in m2 and GLI per patch)
+import matplotlib.pyplot as plt
+for f in sorted((RESULTS / 'overlays').iterdir())[:6]:
+    im = cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB)
+    plt.figure(figsize=(9, 9 * im.shape[0] / im.shape[1])); plt.imshow(im); plt.title(f.name); plt.axis('off'); plt.show()

@@ -42,7 +42,7 @@ def parse(path):
     return cells
 
 
-AGRISEG_FILES = ['agrisegnet.py', 'dataset.py', 'metrics.py', 'engine.py', 'train.py', 'evaluate.py', 'onnx_tools.py']
+AGRISEG_FILES = ['agrisegnet.py', 'dataset.py', 'metrics.py', 'engine.py', 'train.py', 'evaluate.py', 'onnx_tools.py', 'benchmark.py']
 
 
 def agriseg_cells():
@@ -73,7 +73,7 @@ def notebook(cells):
 COMBINED_HEAD = """# Consolidated pipeline: RGB crop segmentation + Sequoia NDVI / NDRE
 
 Part 1 (`01_rgb_segmentation_gli`) reads the **RGB dataset from Roboflow**, trains the lightweight CNN (AgriSegNet-Nano)
-and compares it with YOLO26n-seg. Part 2 (`02_sequoia_alignment_indices`) reads the **12 Sequoia TIFs (4 captures x
+and compares it with YOLO26n-seg (both from scratch, FP32 + INT8, 640 / 480 / 320 px). Part 2 (`02_sequoia_alignment_indices`) reads the **12 Sequoia TIFs (4 captures x
 NIR/RED/REG) from Google Drive**, calibrates and aligns them, and computes NDVI and NDRE. Results are saved to
 `MyDrive/AgriEdgeNet_Results` and zipped at the end.
 

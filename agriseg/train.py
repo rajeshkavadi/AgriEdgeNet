@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--aux-w", type=float, default=0.4)
     ap.add_argument("--dice-w", type=float, default=1.0)
     ap.add_argument("--val-every", type=int, default=1)
+    ap.add_argument("--patience", type=int, default=0,
+                    help="stop when val mIoU(crops) has not improved for this many epochs (0 = off)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-amp", action="store_true")
@@ -141,7 +143,7 @@ def main():
     log = open(out / "log.csv", "w", newline="")
     wr = csv.writer(log)
     wr.writerow(["epoch", "loss", "val_mIoU_crops", "val_mIoU_all", "val_pixel_acc", "lr", "sec"])
-    best, t0 = -1.0, time.time()
+    best, best_ep, t0 = -1.0, -1, time.time()
 
     for ep in range(a.epochs):
         model.train()
@@ -169,13 +171,17 @@ def main():
                                     workers=min(2, a.workers), max_images=a.max_val_images)
             miou, miou_all, pacc = res["mIoU_crops"], res["mIoU_all"], res["pixel_acc"]
             if miou > best:
-                best = miou
+                best, best_ep = miou, ep
                 torch.save({"model": ema.ema.state_dict(), "cfg": cfg, "epoch": ep, "val": res}, out / "best.pt")
         torch.save({"model": ema.ema.state_dict(), "cfg": cfg, "epoch": ep}, out / "last.pt")
         wr.writerow([ep, run / max(nb, 1), miou, miou_all, pacc, opt.param_groups[0]["lr"], time.time() - t0]); log.flush()
         print(f"ep {ep+1:3d}/{a.epochs} loss {run/max(nb,1):.4f} val mIoU(crops) {miou:.4f} best {best:.4f}", flush=True)
+        if a.patience and ep - best_ep >= a.patience:
+            print(f"early stop: no val improvement for {a.patience} epochs (best epoch {best_ep + 1})")
+            break
 
-    json.dump({"params": n_params, "gmacs": gmacs, "best_val_mIoU_crops": best, "args": vars(a)},
+    json.dump({"params": n_params, "gmacs": gmacs, "best_val_mIoU_crops": best, "best_epoch": best_ep + 1,
+               "epochs_run": ep + 1, "args": vars(a)},
               open(out / "summary.json", "w"), indent=2)
     print("done. best val mIoU(crops) =", best)
 

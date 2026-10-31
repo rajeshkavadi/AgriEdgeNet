@@ -59,14 +59,27 @@ def calibration_reader(root, imgsz, size, n=100, seed=0):
     return Reader()
 
 
+QUANT_OPS = ["Conv", "MatMul"]   # same INT8 recipe for every model compared: weights + inputs of Conv/MatMul
+
+
+def export_size(arch, imgsz):
+    m = 128 if arch == "agrisegnet" else 32
+    return (imgsz + m - 1) // m * m
+
+
 def quantize_int8(fp32, int8, reader):
     from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
     from onnxruntime.quantization.shape_inference import quant_pre_process
     pre = Path(str(fp32).replace(".onnx", "_pre.onnx"))
     quant_pre_process(str(fp32), str(pre))
     quantize_static(str(pre), str(int8), reader, quant_format=QuantFormat.QDQ, per_channel=True,
-                    activation_type=QuantType.QInt8, weight_type=QuantType.QInt8)
+                    activation_type=QuantType.QInt8, weight_type=QuantType.QInt8, op_types_to_quantize=QUANT_OPS)
     pre.unlink(missing_ok=True)
+    import onnx                      # keep the FP32 model's metadata (Ultralytics reads task/names/imgsz from it)
+    src, q = onnx.load(str(fp32)), onnx.load(str(int8))
+    del q.metadata_props[:]
+    q.metadata_props.extend(src.metadata_props)
+    onnx.save(q, str(int8))
     return int8
 
 
@@ -99,8 +112,8 @@ def main():
     ap.add_argument("--out", default="deploy")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    size = (a.imgsz + 127) // 128 * 128
-    model, _ = build_from_ckpt(a.ckpt)
+    model, ck = build_from_ckpt(a.ckpt)
+    size = export_size(ck["cfg"].get("arch", "agrisegnet"), a.imgsz)
     fp32 = export(model, out / "model_fp32.onnx", size, a.output_stride)
     int8 = quantize_int8(fp32, out / "model_int8.onnx", calibration_reader(a.data, a.imgsz, size, a.calib))
     res = {"input": [1, 3, size, size], "output_stride": a.output_stride}

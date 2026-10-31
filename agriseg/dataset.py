@@ -26,7 +26,7 @@ IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32) * 255
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32) * 255
 IGNORE = 255
-PAD_MULT = 128   # 1/32 feature map must divide by the context-pool bins (1,2,4) -> clean static ONNX/TensorRT graph
+PAD_MULT = 32    # network stride; the onnx exporter rounds agrisegnet inputs to 128 (context-pool bins 1,2,4)
 
 
 def load_names(root: Path) -> List[str]:
