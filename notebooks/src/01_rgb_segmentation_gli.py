@@ -108,7 +108,10 @@ def download_dataset():
     key = ROBOFLOW_API_KEY or os.environ.get('ROBOFLOW_API_KEY')
     if not key and IN_COLAB:
         from google.colab import userdata
-        key = userdata.get('ROBOFLOW_API_KEY')
+        try:
+            key = userdata.get('ROBOFLOW_API_KEY')
+        except Exception:                 # SecretNotFoundError / NotebookAccessError: fall through to the message below
+            key = None
     if not key:
         raise RuntimeError('No Roboflow key: add the Colab Secret ROBOFLOW_API_KEY or fill ROBOFLOW_API_KEY above.')
     from roboflow import Roboflow
