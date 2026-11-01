@@ -248,3 +248,45 @@ this pipeline.
   overlay shows the GSD and per-class area in a header, and area (m2) and GLI on every patch. This is valid only if
   Roboflow resized whole frames; if it cropped or tiled them, set `IMAGES_ARE_FULL_FRAMES = False`. Area assumes flat
   ground, nadir view and a constant 25 m AGL: a 1 m height error is about 8 % in area.
+
+## 9. Results of the first full run (Colab T4, 2026-11-01, seed 0)
+
+Test split: 18 images (68 instances). Both models trained from scratch at 640 px, early stopping on valid with
+patience 50 (Nano best epoch 173 of 223; YOLO26n-seg best epoch 245 of 295). YOLO's confidence threshold, 0.4, was
+chosen on valid and sits at the top of the sweep.
+
+| size | prec | model | params | ONNX KiB | CPU ms (1 thr) | mIoU crops | fenugreek | gram | linseed | potato | wheat |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 640 | fp32 | Nano | 34,742 | 150 | 19.6 | 0.798 | 0.53 | 0.78 | 0.78 | 0.94 | 0.96 |
+| 640 | fp32 | YOLO26n | 3,054,875 | 10,811 | 109.5 | 0.873 | 0.68 | 0.86 | 0.92 | 0.95 | 0.97 |
+| 640 | int8 | Nano | | 125 | | 0.798 | 0.56 | 0.75 | 0.79 | 0.94 | 0.94 |
+| 640 | int8 | YOLO26n | | 3,340 | | 0.870 | 0.68 | 0.86 | 0.92 | 0.95 | 0.95 |
+| 480 | fp32 | Nano | | | 15.9 | 0.771 | 0.44 | 0.77 | 0.74 | 0.94 | 0.96 |
+| 480 | fp32 | YOLO26n | | | 78.6 | 0.872 | 0.68 | 0.85 | 0.90 | 0.96 | 0.97 |
+| 320 | fp32 | Nano | | | 7.3 | 0.740 | 0.41 | 0.73 | 0.69 | 0.93 | 0.94 |
+| 320 | int8 | Nano | | | | 0.710 | 0.32 | 0.68 | 0.68 | 0.95 | 0.91 |
+| 320 | fp32 | YOLO26n | | | 26.0 | 0.864 | 0.66 | 0.84 | 0.90 | 0.95 | 0.97 |
+| 320 | int8 | YOLO26n | | | | 0.861 | 0.65 | 0.84 | 0.90 | 0.95 | 0.96 |
+
+Paired bootstrap, Nano - YOLO (mIoU crops, 95 % CI): 640 fp32 -0.108 [-0.209, -0.030]; 640 int8 -0.117 [-0.218, -0.034];
+480 fp32 -0.098 [-0.186, -0.028]; 320 fp32 -0.145 [-0.252, -0.051]; 320 int8 -0.148 [-0.265, -0.049].
+INT8 latency on ORT-CPU is not meaningful (emulated) and is omitted.
+
+**Reading.**
+* The claim "smaller *and* better" is refuted on this data: YOLO26n-seg (scratch) is significantly better at every
+  size and precision. The defensible claim is a trade-off: 88x fewer parameters, a 72x smaller FP32 file (27x for
+  INT8) and 5.6x lower 1-thread CPU latency at 640 px, for -0.075 mIoU (-9 %).
+* The gap sits almost entirely in the minority crops: fenugreek (-0.15), linseed (-0.14) and gram (-0.08). Wheat and
+  potato are at parity (0.94 to 0.97). These are also the crops with the fewest images, so their IoUs are the least
+  certain.
+* Nano loses accuracy as input shrinks (0.798 -> 0.740 at 320 px); YOLO barely does (0.873 -> 0.864). Nano also loses
+  3 points to INT8 at 320 px, while YOLO loses under 0.5 at every size.
+* **On a CPU-class device YOLO26n at 320 px (0.864, 26 ms) beats Nano at 640 px (0.798, 19.6 ms)** for about 1.3x the
+  latency. Nano wins only where weight or activation memory rules YOLO out (microcontrollers, a 10.8 MB FP32 / 3.3 MB INT8
+  model), or where the segmentation must share a small CPU with other tasks.
+* Limitations: single seed; 18 test images; validation has 1 image each of fenugreek and linseed; the YOLO threshold is
+  at the edge of the sweep; random Roboflow split.
+
+**Sequoia indices.** All 4 captures were registered by ECC (no fallback), within 1.65 px of the flight-median rig
+transform. Median NDVI 0.55 to 0.66, median NDRE 0.03 to 0.08, NDRE > NDVI on at most 0.21 % of vegetation pixels.
+These are identical to the values measured locally.
