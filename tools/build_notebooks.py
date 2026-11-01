@@ -42,7 +42,7 @@ def parse(path):
     return cells
 
 
-AGRISEG_FILES = ['agrisegnet.py', 'dataset.py', 'metrics.py', 'engine.py', 'train.py', 'evaluate.py', 'onnx_tools.py', 'benchmark.py']
+AGRISEG_FILES = ['agrisegnet.py', 'dataset.py', 'metrics.py', 'engine.py', 'train.py', 'evaluate.py', 'onnx_tools.py', 'benchmark.py', 'instances.py']
 
 
 def agriseg_cells():

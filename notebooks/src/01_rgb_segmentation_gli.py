@@ -1,5 +1,5 @@
 # %% [markdown]
-# # RGB crop segmentation with a device-agnostic lightweight CNN (AgriSegNet-Nano) + per-patch GLI and area
+# # RGB crop segmentation with a device-agnostic lightweight CNN (AgriSegNet-Nano) + per-field GLI and area
 #
 # Replaces YOLO26n-seg with **AgriSegNet-Nano**: 34.7k parameters, 0.25 GMACs at 640 px, built only from
 # operators that every edge runtime supports. After BN folding the exported graph contains Conv
@@ -7,11 +7,17 @@
 # integer factors. It is static, with no Shape/Slice ops, so it runs on TensorRT (Jetson Nano/Orin), ONNX Runtime
 # (Raspberry Pi), OpenVINO, NPUs and, via TFLite-Micro, microcontrollers.
 #
+# **Output is per field (instance segmentation), like YOLO.** Nano predicts, per pixel, the crop class and a field-boundary
+# probability (a 2.3k-parameter boundary head). A short grouping step (`agriseg/instances.py`) turns these into separate
+# fields, each with crop class, confidence, mask and box: bottom-up instance segmentation. Touching fields of the same
+# crop are split where the boundary head draws a line between them. Mask mAP is therefore computed for Nano and YOLO
+# with one shared, COCO-equivalent implementation (verified against pycocotools).
+#
 # Flow: Roboflow export (train/valid/test, YOLO polygon labels) -> semantic masks -> train AgriSegNet-Nano and the
 # YOLO26n-seg baseline, both **from scratch**, same split / input size / epoch budget, both with **early stopping on
 # the valid split** -> YOLO's confidence threshold chosen on valid -> **deployment benchmark on test**: both models
 # exported to ONNX at 640 / 480 / 320 px, each in FP32 and INT8 (same quantisation recipe), scored with ONNX Runtime
-# (mIoU, per-class IoU, paired bootstrap CI, size, CPU latency) -> per-patch area (m2) and GLI drawn on the test images.
+# (mIoU, per-class IoU, mask mAP50 / mAP50-95, paired bootstrap CI, size, CPU latency) -> per-field area (m2) and GLI drawn on the test images.
 #
 # **Baseline.** YOLO26n-seg (3.13M params, 10.6 GFLOPs @640), the smallest YOLO26 segmentation model, trained from random
 # initialisation like Nano (34.7k params), so the comparison isolates architecture and size, not pretraining.
@@ -59,6 +65,7 @@ RESULTS = Path(os.environ.get('SEG_OUT', str(RESULTS_ROOT / 'Segmentation')))
 
 # Model and training (same budget for Nano and YOLO)
 ARCH, WIDTH = 'nano', 1.0          # nano: 34.7k params (width 0.5 -> 11.4k)
+INSTANCE = True                    # + field-boundary head (37.0k params total): per-field output like YOLO
 TRAIN_IMGSZ = int(os.environ.get('SEG_IMGSZ', 640))
 EPOCHS = int(os.environ.get('SEG_EPOCHS', 300))      # upper bound; early stopping ends training sooner
 PATIENCE = int(os.environ.get('SEG_PATIENCE', 50))   # stop after this many epochs without val improvement (from-scratch starts slowly)
@@ -76,7 +83,6 @@ YOLO_CONF_SWEEP = [0.05, 0.1, 0.25, 0.4]                    # chosen on valid, t
 # footprint divided by that image's own width/height (valid only if Roboflow resized whole frames, not crops/tiles).
 CAMERA = {'sensor_w_mm': 3.68, 'sensor_h_mm': 2.76, 'focal_mm': 3.04, 'native_px': (3280, 2464), 'height_agl_m': 25.0}
 IMAGES_ARE_FULL_FRAMES = True      # Option A: Roboflow v4 'Resize 640x640' of full frames in every split
-MIN_PATCH_FRACTION = 0.002         # connected regions smaller than this share of the image are ignored
 
 # GLI (illustrative, NOT validated)
 GLI_VEG_THRESHOLD = 0.0
@@ -90,7 +96,7 @@ IMG_EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 
 sys.path.insert(0, str(AGRISEG_DIR))
 from agrisegnet import build_model, count_params, count_flops, peak_activation_bytes   # noqa: E402
-from engine import build_from_ckpt, predict_image                                      # noqa: E402
+from engine import build_from_ckpt, predict_instances                                  # noqa: E402
 from dataset import load_names, find_split_dir                                          # noqa: E402
 
 
@@ -187,7 +193,7 @@ leakage_report(ds_root)
 
 # %%
 # ---------------------------------------------------------------- model budget (no data needed)
-_m = build_model(ARCH, len(class_names) + 1, WIDTH, aux=False)
+_m = build_model(ARCH, len(class_names) + 1, WIDTH, aux=False, instance=INSTANCE)
 print(f'{ARCH} width {WIDTH}: {count_params(_m):,} params, {count_flops(_m, (TRAIN_IMGSZ, TRAIN_IMGSZ)):.3f} GMACs @ {TRAIN_IMGSZ}')
 for s in sorted({256, 320, TRAIN_IMGSZ}):
     print(f'  peak INT8 activations @ {s}px: {peak_activation_bytes(_m, (s, s)) / 2**20:.2f} MiB')
@@ -197,9 +203,10 @@ for s in sorted({256, 320, TRAIN_IMGSZ}):
 RUNS = RESULTS / 'runs'
 ckpts = []
 for seed in SEEDS:
-    out = RUNS / f'{ARCH}_w{WIDTH}_s{seed}'
+    out = RUNS / f'{ARCH}{"_inst" if INSTANCE else ""}_w{WIDTH}_s{seed}'
     run(['train.py', '--data', ds_root, '--arch', ARCH, '--width', WIDTH, '--imgsz', TRAIN_IMGSZ,
-         '--epochs', EPOCHS, '--patience', PATIENCE, '--bs', BATCH, '--seed', seed, '--workers', 2, '--out', out])
+         '--epochs', EPOCHS, '--patience', PATIENCE, '--bs', BATCH, '--seed', seed, '--workers', 2, '--out', out]
+        + (['--instance'] if INSTANCE else []))
     ckpts.append(out / 'best.pt')
     print(json.load(open(out / 'summary.json'))['best_epoch'], 'best epoch of', json.load(open(out / 'summary.json'))['epochs_run'])
 
@@ -209,6 +216,11 @@ from ultralytics import YOLO
 
 yolo_ckpts = {}
 for tag, init in YOLO_BASELINES.items():
+    done = RESULTS / 'yolo' / tag / 'weights' / 'best.pt'
+    if done.is_file():                 # already trained in an earlier run (weights on Drive): reuse, do not retrain
+        print(f'{tag}: reusing {done}')
+        yolo_ckpts[tag] = done
+        continue
     YOLO(init).train(data=str(data_yaml), imgsz=TRAIN_IMGSZ, epochs=EPOCHS, patience=PATIENCE, batch=BATCH,
                      seed=SEEDS[0], pretrained=False, project=str(RESULTS / 'yolo'), name=tag, exist_ok=True,
                      plots=False, device=0 if torch.cuda.is_available() else 'cpu', workers=2)
@@ -260,7 +272,7 @@ json.dump({'yolo_native_test': yolo_native, 'yolo_conf_from_valid': yolo_conf, '
 
 
 # %%
-# ---------------------------------------------------------------- per-patch area and GLI from the custom model
+# ---------------------------------------------------------------- per-field area and GLI from the custom model
 def gsd_m(img_w, img_h):
     """Ground sample distance (m/px) along x and y for a full camera frame resized to img_w x img_h."""
     fw = CAMERA['height_agl_m'] * CAMERA['sensor_w_mm'] / CAMERA['focal_mm']
@@ -314,41 +326,40 @@ def draw_label(img, text, x, y, placed):
     placed.append(box)
 
 
-def analyse_image(path, label_map, names):
-    """label_map: 0 = background, c+1 = class c. Patches = connected regions of one class."""
+def analyse_image(path, instances, names):
+    """instances: per-field predictions (class, score, mask, box) from predict_instances()."""
     img = cv2.imread(str(path))
     h, w = img.shape[:2]
     gli, a_px = gli_map(img), area_per_pixel_m2(w, h)
     vis, placed, rows = img.copy(), [], []
-    min_px = MIN_PATCH_FRACTION * h * w
-    for c, name in enumerate(names, start=1):
-        n, comp, stats, cent = cv2.connectedComponentsWithStats((label_map == c).astype(np.uint8), connectivity=8)
-        for k in range(1, n):
-            if stats[k, cv2.CC_STAT_AREA] < min_px:
-                continue
-            own = comp == k
-            g = gli[own]; g = g[np.isfinite(g)]
-            veg = g > GLI_VEG_THRESHOLD
-            gli_all = float(g.mean()) if g.size else np.nan
-            cond = condition(name, gli_all)
-            area = int(own.sum()) * a_px
-            rate = REFERENCE_YIELD_KG_HA.get(name, np.nan) / 1e4 * YIELD_FACTORS[cond]
-            rows.append({'image': path.name, 'patch': len(rows) + 1, 'class': name, 'pixels': int(own.sum()),
-                         'area_m2': area, 'veg_fraction': float(veg.mean()) if g.size else np.nan,
-                         'gli_mean': gli_all, 'gli_median': float(np.median(g)) if g.size else np.nan,
-                         'gli_mean_veg_only': float(g[veg].mean()) if veg.any() else np.nan,
-                         'condition_indicative': cond, 'indicative_yield_kg': area * rate})
-            col = np.array(PALETTE[(c - 1) % len(PALETTE)], np.float32)
-            vis[own] = (vis[own].astype(np.float32) * 0.55 + col * 0.45).astype(np.uint8)
-            draw_label(vis, f'#{len(rows)} {name} A:{area:.1f}m2 GLI:{gli_all:.2f}',
-                       int(cent[k][0]), int(cent[k][1]), placed)
+    for inst in sorted(instances, key=lambda d: -d['mask'].sum()):
+        own, name = inst['mask'], names[inst['class']]
+        g = gli[own]; g = g[np.isfinite(g)]
+        veg = g > GLI_VEG_THRESHOLD
+        gli_all = float(g.mean()) if g.size else np.nan
+        cond = condition(name, gli_all)
+        area = int(own.sum()) * a_px
+        rate = REFERENCE_YIELD_KG_HA.get(name, np.nan) / 1e4 * YIELD_FACTORS[cond]
+        rows.append({'image': path.name, 'field': len(rows) + 1, 'class': name, 'confidence': inst['score'],
+                     'box_xyxy': inst['box'], 'pixels': int(own.sum()),
+                     'area_m2': area, 'veg_fraction': float(veg.mean()) if g.size else np.nan,
+                     'gli_mean': gli_all, 'gli_median': float(np.median(g)) if g.size else np.nan,
+                     'gli_mean_veg_only': float(g[veg].mean()) if veg.any() else np.nan,
+                     'condition_indicative': cond, 'indicative_yield_kg': area * rate})
+        col = np.array(PALETTE[inst['class'] % len(PALETTE)], np.float32)
+        vis[own] = (vis[own].astype(np.float32) * 0.55 + col * 0.45).astype(np.uint8)
+        cnts, _ = cv2.findContours(own.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, cnts, -1, (255, 255, 255), 2)       # field outline: separates touching fields
+        ys, xs = np.nonzero(own)
+        draw_label(vis, f'#{len(rows)} {name} {inst["score"]:.2f} A:{area:.1f}m2 GLI:{gli_all:.2f}',
+                   int(xs.mean()), int(ys.mean()), placed)
     # header: GSD and per-class totals for this image
     gx, gy = gsd_m(w, h)
     tot = {}
     for r in rows:
         tot[r['class']] = tot.get(r['class'], 0.0) + r['area_m2']
     lines = [f'GSD {100 * gx:.2f}x{100 * gy:.2f} cm/px @ {CAMERA["height_agl_m"]:.0f} m',
-             '  '.join(f'{k}: {v:.1f} m2' for k, v in sorted(tot.items())) or 'no crop patches']
+             '  '.join(f'{k}: {v:.1f} m2' for k, v in sorted(tot.items())) or 'no crop fields']
     bar = np.zeros((22 * len(lines) + 6, w, 3), np.uint8)
     for i, t in enumerate(lines):
         cv2.putText(bar, t, (6, 20 + 22 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
@@ -363,11 +374,11 @@ def run_patch_analysis(ckpt, image_dir, out_dir=RESULTS, imgsz=TRAIN_IMGSZ):
     rows = []
     for path in sorted(p for p in Path(image_dir).iterdir() if p.suffix.lower() in IMG_EXT):
         rgb = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
-        vis, rr = analyse_image(path, predict_image(model, rgb, imgsz, dev), names)
+        vis, rr = analyse_image(path, predict_instances(model, rgb, imgsz, dev), names)
         cv2.imwrite(str(out_dir / 'overlays' / path.name), vis)
         rows += rr
     if rows:
-        with open(out_dir / 'segmentation_patches.csv', 'w', newline='') as f:
+        with open(out_dir / 'segmentation_fields.csv', 'w', newline='') as f:
             wr = csv.DictWriter(f, list(rows[0])); wr.writeheader(); wr.writerows(rows)
     with open(out_dir / 'SEGMENTATION_REPORT.txt', 'w') as f:
         f.write(f'AgriSegNet-Nano crop segmentation report\n{"=" * 70}\n')
@@ -383,17 +394,17 @@ def run_patch_analysis(ckpt, image_dir, out_dir=RESULTS, imgsz=TRAIN_IMGSZ):
         f.write('Condition and yield are INDICATIVE (unvalidated thresholds and factors).\n\n')
         for name in sorted({r['class'] for r in rows}):
             rr = [r for r in rows if r['class'] == name]
-            f.write(f'{name:<10s} patches {len(rr):3d}  area {sum(r["area_m2"] for r in rr):10.2f} m2  '
+            f.write(f'{name:<10s} fields {len(rr):3d}  area {sum(r["area_m2"] for r in rr):10.2f} m2  '
                     f'mean GLI {np.nanmean([r["gli_mean"] for r in rr]):.3f}\n')
         f.write(f'\nTotal area {sum(r["area_m2"] for r in rows):.2f} m2\n')
-    print(f'{len(rows)} patches -> {out_dir}')
+    print(f'{len(rows)} fields -> {out_dir}')
     return rows
 
 
 seg_rows = run_patch_analysis(ckpts[0], find_split_dir(ds_root, 'test') / 'images')
 
 # %%
-# ---------------------------------------------------------------- show segmented test images (area in m2 and GLI per patch)
+# ---------------------------------------------------------------- show segmented test images (area in m2 and GLI per field)
 import matplotlib.pyplot as plt
 for f in sorted((RESULTS / 'overlays').iterdir())[:6]:
     im = cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB)

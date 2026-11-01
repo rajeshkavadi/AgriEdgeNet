@@ -290,3 +290,30 @@ INT8 latency on ORT-CPU is not meaningful (emulated) and is omitted.
 **Sequoia indices.** All 4 captures were registered by ECC (no fallback), within 1.65 px of the flight-median rig
 transform. Median NDVI 0.55 to 0.66, median NDRE 0.03 to 0.08, NDRE > NDVI on at most 0.21 % of vegetation pixels.
 These are identical to the values measured locally.
+
+## 10. Per-field (instance) output for Nano
+
+**Design.** Nano gets a field-boundary head: 2.3k parameters at 1/4 resolution, for 37,047 parameters total with 6
+classes and 0.30 GMACs at 640 px. Its ONNX graph is still static; the only new op is one Concat. `instances.group_instances`
+turns class probabilities + boundary probability into fields:
+1. connected regions of each crop are candidate fields;
+2. a region is split only when predicted boundaries cut it into >= 2 parts, each large enough to be a field
+   (>= 10 % of the region and >= 0.2 % of the image), with boundary pixels reassigned by watershed;
+3. the field's confidence is the mean probability of its class.
+
+By definition this is **bottom-up (proposal-free) instance segmentation**: the network stays dense, the system outputs
+instances. YOLO is top-down: it proposes objects, then masks them.
+
+**What was tried and dropped.** A distance-to-field-edge output with distance-based seeding over-split fields. On
+synthetic data the distance map followed crop texture rather than field shape, giving mask mAP50 0.40 vs 0.88 for
+connected regions. Boundary-only grouping with the split rule above matches connected regions where fields do not touch,
+and is the only variant that can separate touching fields of the same crop.
+
+**Metric.** `instances.MaskAP` gives COCO-style mask AP (101-point, IoU 0.50:0.95). It matches pycocotools exactly on the
+same predictions (mAP50 0.570, mAP75 0.496, mAP50-95 0.462). Ultralytics' own `val()` reported 0.498 / 0.449 / 0.376
+on those predictions, because it scores masks at reduced resolution. Report the shared COCO-style number for both models
+and Ultralytics' number only as a footnote.
+
+**Synthetic check (256 px, not a real result).** Nano+boundary reached mIoU 0.897, mask mAP50 0.878, mAP50-95 0.615;
+plain Nano with connected regions reached 0.868 / 0.833 / 0.578. INT8 cost nothing. Whether the boundary head separates
+touching same-crop fields can only be measured on the Roboflow data.

@@ -15,7 +15,7 @@ def build_from_ckpt(path, device="cpu"):
     ck = torch.load(path, map_location=device, weights_only=False)
     cfg = ck["cfg"]
     model = build_model(cfg.get("arch", "agrisegnet"), cfg["num_classes"], width=cfg["width"],
-                        depth=cfg["depth"], aux=False)
+                        depth=cfg["depth"], aux=False, instance=cfg.get("instance", False))
     sd = {k: v for k, v in ck["model"].items() if not k.startswith("aux_head")}
     model.load_state_dict(sd)
     return model.to(device).eval(), ck
@@ -28,26 +28,38 @@ def predict_semantic(model, batch, device, amp=False, tta=False) -> np.ndarray:
     nh, nw = batch["valid_hw"]
     h, w = batch["gt"].shape
     with torch.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
-        logits = model(x).float()
+        logits = model(x).float()[:, :model.num_classes]          # class channels only
         if tta:
             logits = logits.softmax(1)
-            logits = logits + model(x.flip(3)).float().softmax(1).flip(3)
-            logits = logits + model(x.flip(2)).float().softmax(1).flip(2)
+            logits = logits + model(x.flip(3)).float()[:, :model.num_classes].softmax(1).flip(3)
+            logits = logits + model(x.flip(2)).float()[:, :model.num_classes].softmax(1).flip(2)
     logits = logits[:, :, :nh, :nw]
     logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
     return logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
 
 
 @torch.no_grad()
-def predict_image(model, img_rgb, imgsz, device=torch.device("cpu")) -> np.ndarray:
-    """Label map (0=bg, c+1) at the image's own resolution, for any RGB image."""
+def predict_logits(model, img_rgb, imgsz, device=torch.device("cpu")) -> np.ndarray:
+    """All output channels (class logits [+ field-boundary logit]) at the image's own resolution: (C[+1], H, W)."""
     x, (nh, nw) = preprocess(img_rgb, imgsz)
     logits = model(x.unsqueeze(0).to(device)).float()
-    logits = logits[:, :, :nh, :nw] if logits.shape[-2:] == x.shape[-2:] else \
-        F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)[:, :, :nh, :nw]
+    if logits.shape[-2:] != x.shape[-2:]:
+        logits = F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
     h, w = img_rgb.shape[:2]
-    logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
-    return logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
+    logits = F.interpolate(logits[:, :, :nh, :nw], size=(h, w), mode="bilinear", align_corners=False)
+    return logits[0].cpu().numpy()
+
+
+def predict_image(model, img_rgb, imgsz, device=torch.device("cpu")) -> np.ndarray:
+    """Label map (0=bg, c+1) at the image's own resolution, for any RGB image."""
+    return predict_logits(model, img_rgb, imgsz, device)[:model.num_classes].argmax(0).astype(np.uint8)
+
+
+def predict_instances(model, img_rgb, imgsz, device=torch.device("cpu")):
+    """Per-field instances (class, score, mask, box). Uses the instance head if the model has one,
+    otherwise connected regions of each class."""
+    from instances import group_instances, split_outputs
+    return group_instances(*split_outputs(predict_logits(model, img_rgb, imgsz, device), model.num_classes))
 
 
 @torch.no_grad()

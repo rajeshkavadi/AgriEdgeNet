@@ -92,7 +92,7 @@ def evaluate_onnx(path, root, split, imgsz, size, output_stride=1):
     for i in range(len(ds)):
         b = ds[i]
         nh, nw = b["valid_hw"]
-        logits = torch.from_numpy(sess.run(None, {"image": _square(b["image"], size)})[0])
+        logits = torch.from_numpy(sess.run(None, {"image": _square(b["image"], size)})[0])[:, :ds.nc + 1]
         if output_stride != 1:
             logits = F.interpolate(logits, size=(size, size), mode="bilinear", align_corners=False)
         logits = F.interpolate(logits[:, :, :nh, :nw], size=tuple(b["gt"].shape), mode="bilinear", align_corners=False)

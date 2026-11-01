@@ -59,6 +59,18 @@ def dice_loss(logits, target, n_cls, ignore=255, eps=1.0):
     return 1 - dice[present].mean() if present.any() else logits.sum() * 0
 
 
+def instance_loss(logits, target, pos_w):
+    """Field-boundary loss. logits/target: (B, 1, H, W); target -1 = ignore.
+    Weighted BCE + soft Dice, because boundary pixels are only a few % of the image."""
+    valid = target[:, 0] >= 0
+    if not valid.any():
+        return logits.sum() * 0
+    bl, bt = logits[:, 0][valid], target[:, 0][valid]
+    bce = F.binary_cross_entropy_with_logits(bl, bt, pos_weight=torch.tensor(pos_w, device=bl.device))
+    pb = bl.sigmoid()
+    return bce + 1 - (2 * (pb * bt).sum() + 1) / (pb.sum() + bt.sum() + 1)
+
+
 def seed_everything(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
 
@@ -86,6 +98,10 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--arch", choices=["agrisegnet", "nano"], default="agrisegnet")
     ap.add_argument("--max-params", type=int, default=None, help="default: 50k for nano, 1M for agrisegnet")
+    ap.add_argument("--instance", action="store_true",
+                    help="nano only: add the field-boundary head for per-field (instance) output")
+    ap.add_argument("--inst-w", type=float, default=1.0, help="weight of the instance-head loss")
+    ap.add_argument("--boundary-pos-w", type=float, default=5.0, help="BCE positive weight for (rare) boundary pixels")
     ap.add_argument("--width", type=float, default=1.0)
     ap.add_argument("--depth", type=int, default=1)
     ap.add_argument("--aux-w", type=float, default=0.4)
@@ -118,10 +134,10 @@ def main():
     print("class weights    :", dict(zip(["background"] + names, np.round(cw, 2))))
     ce = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32, device=dev), ignore_index=255)
 
-    model = build_model(a.arch, n_cls, width=a.width, depth=a.depth, aux=a.aux_w > 0).to(dev)
+    model = build_model(a.arch, n_cls, width=a.width, depth=a.depth, aux=a.aux_w > 0, instance=a.instance).to(dev)
     model = model.to(memory_format=torch.channels_last)
     n_params = count_params(model)
-    gmacs = count_flops(build_model(a.arch, n_cls, a.width, a.depth, aux=False), (a.imgsz, a.imgsz))
+    gmacs = count_flops(build_model(a.arch, n_cls, a.width, a.depth, aux=False, instance=a.instance), (a.imgsz, a.imgsz))
     budget = a.max_params or PARAM_BUDGET[a.arch]
     print(f"{a.arch} w={a.width} d={a.depth}: {n_params:,} params (budget {budget:,}), {gmacs:.3f} GMACs @ {a.imgsz}")
     if n_params >= budget:
@@ -139,7 +155,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     ema = ModelEMA(model)
 
-    cfg = {"arch": a.arch, "num_classes": n_cls, "width": a.width, "depth": a.depth, "imgsz": a.imgsz, "names": names}
+    cfg = {"arch": a.arch, "instance": a.instance, "num_classes": n_cls, "width": a.width, "depth": a.depth, "imgsz": a.imgsz, "names": names}
     log = open(out / "log.csv", "w", newline="")
     wr = csv.writer(log)
     wr.writerow(["epoch", "loss", "val_mIoU_crops", "val_mIoU_all", "val_pixel_acc", "lr", "sec"])
@@ -148,16 +164,19 @@ def main():
     for ep in range(a.epochs):
         model.train()
         run, nb = 0.0, 0
-        for x, y in dl:
+        for x, y, t in dl:
             x = x.to(dev, non_blocking=True).to(memory_format=torch.channels_last)
             y = y.to(dev, non_blocking=True)
             with torch.autocast(device_type=dev.type, enabled=amp):
                 o = model(x)
                 main_o = (o["out"] if isinstance(o, dict) else o).float()   # tensor when --aux-w 0
                 loss = ce(main_o, y) + a.dice_w * dice_loss(main_o, y, n_cls)
-                if isinstance(o, dict):
+                if isinstance(o, dict) and "aux" in o:
                     aux_o = o["aux"].float()
                     loss = loss + a.aux_w * (ce(aux_o, y) + a.dice_w * dice_loss(aux_o, y, n_cls))
+                if isinstance(o, dict) and "inst" in o:
+                    loss = loss + a.inst_w * instance_loss(o["inst"].float(), t.to(dev, non_blocking=True),
+                                                           a.boundary_pos_w)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)

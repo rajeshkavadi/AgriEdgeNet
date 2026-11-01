@@ -11,7 +11,10 @@ Same treatment for both model families, so the comparison is like for like:
   * accuracy = semantic mIoU on the split at the original label resolution (YOLO instances -> semantic map,
     highest confidence wins, conf fixed from the valid split);
   * latency = median ONNX Runtime CPU time of the graph alone (no pre/post-processing), `--threads` threads;
-  * paired bootstrap 95 % CI of (custom - YOLO) per-image mIoU for each size x precision.
+  * paired bootstrap 95 % CI of (custom - YOLO) per-image mIoU for each size x precision;
+  * instance metrics with one shared implementation (instances.MaskAP): mask mAP50, mAP75, mAP50-95 against the
+    per-field ground-truth polygons. Nano's fields come from its instance head (or connected regions without one);
+    YOLO's from its own masks, predicted at conf 0.001 for AP (its semantic map uses the valid-chosen conf).
 """
 from __future__ import annotations
 
@@ -28,6 +31,8 @@ import torch.nn.functional as F
 from dataset import IMG_EXT, CropSegEval, find_split_dir, preprocess
 from engine import build_from_ckpt
 from evaluate import YoloPredictor, img_miou_crops, model_name, paired_bootstrap
+from instances import (MaskAP, group_instances, gt_instances, instances_to_label_map, split_outputs,
+                       yolo_instances)
 from metrics import ConfusionMatrix
 from onnx_tools import _square, export, export_size, quantize_int8
 
@@ -65,11 +70,13 @@ def letterbox(rgb, size):
 
 # ----------------------------------------------------------------------------- per-model runners
 class CustomOnnx:
-    def __init__(self, path, imgsz, size, threads):
+    """-> (semantic map, instances, field-voted semantic map)."""
+
+    def __init__(self, path, imgsz, size, threads, n_cls):
         import onnxruntime as ort
         so = ort.SessionOptions(); so.intra_op_num_threads = threads
         self.sess = ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
-        self.imgsz, self.size = imgsz, size
+        self.imgsz, self.size, self.n_cls = imgsz, size, n_cls
         self.feed_shape = (1, 3, size, size)
 
     def __call__(self, batch):
@@ -77,21 +84,33 @@ class CustomOnnx:
         logits = torch.from_numpy(self.sess.run(None, {"image": _square(batch["image"], self.size)})[0])
         if logits.shape[-1] != self.size:                       # output-stride 8 graphs
             logits = F.interpolate(logits, size=(self.size, self.size), mode="bilinear", align_corners=False)
-        logits = F.interpolate(logits[:, :, :nh, :nw], size=tuple(batch["gt"].shape), mode="bilinear",
-                               align_corners=False)
-        return logits.argmax(1)[0].numpy().astype(np.uint8)
+        h, w = batch["gt"].shape
+        logits = F.interpolate(logits[:, :, :nh, :nw], size=(h, w), mode="bilinear", align_corners=False)[0].numpy()
+        probs, bnd = split_outputs(logits, self.n_cls)
+        insts = group_instances(probs, bnd)
+        return probs.argmax(0).astype(np.uint8), insts, instances_to_label_map(insts, h, w)
 
     def latency_ms(self, n=30):
         return _latency(self.sess, "image", self.feed_shape, n)
 
 
 class YoloOnnx(YoloPredictor):
+    """-> (semantic map from instances with score >= conf, all instances (conf 0.001, for AP), same semantic map)."""
+
     def __init__(self, path, size, conf, threads):
         super().__init__(str(path), size, conf, "cpu")
         import onnxruntime as ort
         so = ort.SessionOptions(); so.intra_op_num_threads = threads
         self.sess = ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
         self.feed_shape = (1, 3, size, size)
+
+    def __call__(self, batch):
+        h, w = batch["gt"].shape
+        r = self.m.predict(batch["path"], imgsz=self.imgsz, conf=0.001, max_det=50, device=self.device,
+                           verbose=False, retina_masks=True)[0]
+        insts = yolo_instances(r, h, w)
+        sem = instances_to_label_map([i for i in insts if i['score'] >= self.conf], h, w)
+        return sem, insts, sem
 
     def latency_ms(self, n=30):
         return _latency(self.sess, self.sess.get_inputs()[0].name, self.feed_shape, n)
@@ -155,29 +174,35 @@ def main():
         for ck in a.custom:
             s, files, n = export_custom(ck, size, out / "onnx", calib)
             for prec, f in files.items():
-                runners.append((model_name(ck), "custom", prec, n, f, CustomOnnx(f, size, s, a.threads)))
+                runners.append((model_name(ck), "custom", prec, n, f, CustomOnnx(f, size, s, a.threads, ds.nc + 1)))
         for w, c in zip(a.yolo, confs):
             s, files, n = export_yolo(w, size, out / "onnx", calib)
             for prec, f in files.items():
                 runners.append((f"yolo_{model_name(w)}", "yolo", prec, n, f, YoloOnnx(f, s, c, a.threads)))
 
         cms = {r[0] + r[2]: ConfusionMatrix(len(names)) for r in runners}
+        cms_field = {k: ConfusionMatrix(len(names)) for k in cms}
+        aps = {k: MaskAP(ds.nc) for k in cms}
         per_img = {k: [] for k in cms}
         for i in range(len(ds)):
             b = ds[i]
             gt = b["gt"].numpy().astype(np.uint8)
+            gts = gt_instances(b["gt_inst"], b["gt_cls"])
             for name, _, prec, _, _, run in runners:
-                pm = run(b)
+                pm, insts, voted = run(b)
                 cms[name + prec].update(gt, pm)
+                cms_field[name + prec].update(gt, voted)
+                aps[name + prec].add(insts, gts)
                 one = ConfusionMatrix(len(names)); one.update(gt, pm)
                 per_img[name + prec].append(img_miou_crops(one))
         for name, kind, prec, n, f, run in runners:
             r = cms[name + prec].summary(names)
+            ap = aps[name + prec].summary(list(ds.names))
             rows.append({"model": name, "kind": kind, "size": size, "precision": prec, "params": n,
                          "onnx_kib": round(f.stat().st_size / 1024, 1), "latency_ms_cpu": run.latency_ms(),
-                         **r})
+                         **r, "mIoU_crops_field_voted": cms_field[name + prec].summary(names)["mIoU_crops"], **ap})
             print(f"{size:>4}px {prec} {name:<28s} mIoU(crops) {r['mIoU_crops']:.4f}  pix acc {r['pixel_acc']:.4f}  "
-                  f"{rows[-1]['latency_ms_cpu']:.1f} ms")
+                  f"mask mAP50 {ap['mask_mAP50']:.4f}  mAP50-95 {ap['mask_mAP50_95']:.4f}  {rows[-1]['latency_ms_cpu']:.1f} ms")
         for prec in ("fp32", "int8"):
             for cn, ck_, cp, *_ in [r for r in runners if r[1] == "custom" and r[2] == prec]:
                 for yn, yk, yp, *_ in [r for r in runners if r[1] == "yolo" and r[2] == prec]:
@@ -187,10 +212,12 @@ def main():
 
     json.dump({"rows": rows, "paired_bootstrap_mIoU_crops(mean,lo95,hi95)": boot, "args": vars(a)},
               open(out / "benchmark.json", "w"), indent=2)
-    print(f"\n{'size':>4} {'prec':<5}{'model':<28}{'params':>11}{'ONNX KiB':>10}{'CPU ms':>8}{'mIoU crops':>12}")
+    print(f"\n{'size':>4} {'prec':<5}{'model':<28}{'params':>11}{'ONNX KiB':>10}{'CPU ms':>8}{'mIoU':>8}"
+          f"{'mIoU fld':>9}{'mAP50':>8}{'mAP50-95':>9}")
     for r in sorted(rows, key=lambda r: (-r["size"], r["precision"], r["kind"], r["model"])):
         print(f"{r['size']:>4} {r['precision']:<5}{r['model']:<28}{r['params']:>11,}{r['onnx_kib']:>10.0f}"
-              f"{r['latency_ms_cpu']:>8.1f}{r['mIoU_crops']:>12.4f}")
+              f"{r['latency_ms_cpu']:>8.1f}{r['mIoU_crops']:>8.4f}{r['mIoU_crops_field_voted']:>9.4f}"
+              f"{r['mask_mAP50']:>8.4f}{r['mask_mAP50_95']:>9.4f}")
 
 
 if __name__ == "__main__":

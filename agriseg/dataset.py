@@ -77,6 +77,36 @@ def rasterize(polys: List[Tuple[int, np.ndarray]], h: int, w: int) -> np.ndarray
     return mask
 
 
+def rasterize_instances(polys: List[Tuple[int, np.ndarray]], h: int, w: int):
+    """-> (semantic map uint8: 0=bg, c+1; instance map int32: 0=bg, 1..N; class of each instance id).
+    Roboflow polygons are per-field annotations, so each polygon is one instance (later polygons win overlaps)."""
+    sem = np.zeros((h, w), np.uint8)
+    inst = np.zeros((h, w), np.int32)
+    classes = {}
+    for k, (cls, poly) in enumerate(polys, start=1):
+        pts = np.round(poly * np.array([w, h])).astype(np.int32)
+        cv2.fillPoly(sem, [pts], int(cls) + 1)
+        cv2.fillPoly(inst, [pts], k)
+        classes[k] = int(cls)
+    return sem, inst, classes
+
+
+BOUNDARY_WIDTH = 3   # px at training resolution
+
+
+def instance_targets(inst: np.ndarray, sem: np.ndarray) -> np.ndarray:
+    """Boundary target (1, H, W) for the instance head, from an instance-id map: 1 on field edges
+    (field/field and field/background), width ~BOUNDARY_WIDTH px, 0 elsewhere, -1 where `sem` is ignore (255)."""
+    f = inst.astype(np.float32)
+    k = np.ones((3, 3), np.uint8)
+    edge = (cv2.dilate(f, k) != cv2.erode(f, k)).astype(np.uint8)
+    if BOUNDARY_WIDTH > 1:
+        edge = cv2.dilate(edge, np.ones((BOUNDARY_WIDTH, BOUNDARY_WIDTH), np.uint8))
+    t = edge.astype(np.float32)[None]
+    t[:, sem == IGNORE] = -1.0
+    return t
+
+
 def class_frequencies(label_dir: Path, nc: int) -> np.ndarray:
     """Approximate pixel share of [background, class0..] from polygon areas (no image reads)."""
     areas = np.zeros(nc + 1)
@@ -116,7 +146,7 @@ def _color_jitter(img: np.ndarray, rng: random.Random) -> np.ndarray:
     return img
 
 
-def _affine(img, mask, out: int, rng: random.Random, scale_rng=(0.6, 1.6)):
+def _affine(img, mask, out: int, rng: random.Random, scale_rng=(0.6, 1.6), inst=None):
     """Random scale / rotation (any heading) / flip / translation in one warp."""
     h, w = mask.shape
     base = out / max(h, w)
@@ -131,6 +161,10 @@ def _affine(img, mask, out: int, rng: random.Random, scale_rng=(0.6, 1.6)):
     img = cv2.warpAffine(img, M[:2], (out, out), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
     mask = cv2.warpAffine(mask, M[:2], (out, out), flags=cv2.INTER_NEAREST,
                           borderMode=cv2.BORDER_CONSTANT, borderValue=IGNORE)
+    if inst is not None:
+        inst = cv2.warpAffine(inst.astype(np.float32), M[:2], (out, out), flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.int32)
+        return img, mask, inst
     return img, mask
 
 
@@ -159,15 +193,17 @@ class CropSegDataset(Dataset):
         p = self.images[i]
         img = cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
-        mask = rasterize(parse_label_file(self.label_dir / (p.stem + ".txt")), h, w)
-        return img, mask
+        mask, inst, _ = rasterize_instances(parse_label_file(self.label_dir / (p.stem + ".txt")), h, w)
+        return img, mask, inst
 
     def __getitem__(self, i):
-        img, mask = self.load(i)
+        """-> image tensor, semantic target (H, W), field-boundary target (1, H, W)."""
+        img, mask, inst = self.load(i)
         rng = self.rng if self.train else random.Random(i)
-        img, mask = _affine(img, mask, self.imgsz, rng)
+        img, mask, inst = _affine(img, mask, self.imgsz, rng, inst=inst)
         img = _color_jitter(img, rng)
-        return to_tensor(img), torch.from_numpy(mask.astype(np.int64))
+        return (to_tensor(img), torch.from_numpy(mask.astype(np.int64)),
+                torch.from_numpy(instance_targets(inst, mask)))
 
 
 def preprocess(img_rgb: np.ndarray, imgsz: int, pad_mult: int = PAD_MULT):
@@ -200,9 +236,9 @@ class CropSegEval(Dataset):
         p = self.images[i]
         img = cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
-        gt = rasterize(parse_label_file(self.label_dir / (p.stem + ".txt")), h, w)
+        gt, gt_inst, gt_cls = rasterize_instances(parse_label_file(self.label_dir / (p.stem + ".txt")), h, w)
         x, (nh, nw) = preprocess(img, self.imgsz)
-        return {"image": x, "gt": torch.from_numpy(gt.astype(np.int64)),
+        return {"image": x, "gt": torch.from_numpy(gt.astype(np.int64)), "gt_inst": gt_inst, "gt_cls": gt_cls,
                 "valid_hw": (nh, nw), "path": str(p), "rgb": img}
 
 

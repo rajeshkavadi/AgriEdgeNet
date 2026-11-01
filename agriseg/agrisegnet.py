@@ -228,9 +228,10 @@ class AgriSegNetNano(nn.Module):
     largest activation in the network (640*640*num_classes).
     """
 
-    def __init__(self, num_classes: int, width: float = 1.0, aux: bool = True, drop: float = 0.05):
+    def __init__(self, num_classes: int, width: float = 1.0, aux: bool = True, drop: float = 0.05,
+                 instance: bool = False):
         super().__init__()
-        self.num_classes, self.use_aux = num_classes, aux
+        self.num_classes, self.use_aux, self.instance = num_classes, aux, instance
         self.output_stride = 1
         c0, c1, c2, c3 = (_c(c, width) for c in (16, 24, 32, 48))
         self.stem = ConvBNAct(3, c0, 3, 2)                                    # 1/2
@@ -247,6 +248,12 @@ class AgriSegNetNano(nn.Module):
         self.drop = nn.Dropout2d(drop)
         self.head = nn.Conv2d(c2, num_classes, 1)
         self.aux_head = nn.Conv2d(c3, num_classes, 1) if aux else None
+        if instance:
+            # bottom-up instance head at 1/4 resolution: one field-boundary logit per pixel.
+            # Grouping into separate fields happens outside the network (instances.group_instances).
+            self.inst_low = ConvBNAct(c1, c2, 1, 1, act=False)
+            self.inst_refine = DWBlock(c2, c2)
+            self.inst_head = nn.Conv2d(c2, 1, 1)
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
@@ -256,17 +263,30 @@ class AgriSegNetNano(nn.Module):
     def forward(self, x):
         # input H, W must be divisible by 32; fixed integer scale factors keep the exported graph static
         # (no Shape/Slice/Concat ops), which microcontroller and NPU compilers require
-        f8 = self.stage8(self.stage4(self.stem(x)))
+        f4 = self.stage4(self.stem(x))
+        f8 = self.stage8(f4)
         f16 = self.stage16(f8)
         f32 = self.stage32(f16)
         up = lambda t, k: F.interpolate(t, scale_factor=k, mode="bilinear", align_corners=False)
         ctx = self.ctx16(f16) * self.gate(f32) + up(self.ctx32(f32), 2)
-        out = self.head(self.drop(self.refine(up(ctx, 2) + self.low(f8))))
+        d8 = self.refine(up(ctx, 2) + self.low(f8))
+        out = self.head(self.drop(d8))
+        inst = None
+        if self.instance:
+            if self.output_stride != 1:
+                raise ValueError("output_stride 8 is not supported with the instance head")
+            inst = up(self.inst_head(self.inst_refine(up(d8, 2) + self.inst_low(f4))), 4)
         if self.output_stride == 1:
             out = up(out, 8)
-        if self.training and self.use_aux:
-            return {"out": out, "aux": up(self.aux_head(f16), 16)}
-        return out
+        if self.training:
+            o = {"out": out}
+            if self.use_aux:
+                o["aux"] = up(self.aux_head(f16), 16)
+            if inst is not None:
+                o["inst"] = inst
+            return o if len(o) > 1 else out
+        # inference / export: one static output, channels = [class logits..., field-boundary logit]
+        return out if inst is None else torch.cat([out, inst], 1)
 
 
 def peak_activation_bytes(model: nn.Module, imgsz=(640, 640), bytes_per_value=1) -> int:
@@ -291,19 +311,24 @@ ARCHS = {"agrisegnet": AgriSegNet, "nano": AgriSegNetNano}
 PARAM_BUDGET = {"agrisegnet": 1_000_000, "nano": 50_000}
 
 
-def build_model(arch: str, num_classes: int, width: float = 1.0, depth: int = 1, aux: bool = True) -> nn.Module:
+def build_model(arch: str, num_classes: int, width: float = 1.0, depth: int = 1, aux: bool = True,
+                instance: bool = False) -> nn.Module:
     if arch == "nano":
-        return AgriSegNetNano(num_classes, width=width, aux=aux)
+        return AgriSegNetNano(num_classes, width=width, aux=aux, instance=instance)
+    if instance:
+        raise ValueError("instance head is implemented for arch 'nano' only")
     return AgriSegNet(num_classes, width=width, depth=depth, aux=aux)
 
 
 if __name__ == "__main__":
     print(f"{'arch':<11}{'width':>6}{'params':>10}{'GMACs@640':>11}   peak INT8 activations (MiB) @256 / 320 / 640")
-    for arch, w in [("nano", 0.5), ("nano", 0.75), ("nano", 1.0), ("agrisegnet", 0.25), ("agrisegnet", 1.0)]:
-        m = build_model(arch, num_classes=6, width=w, aux=False)
+    for arch, w, ins in [("nano", 0.5, False), ("nano", 1.0, False), ("nano", 1.0, True),
+                         ("agrisegnet", 0.25, False), ("agrisegnet", 1.0, False)]:
+        m = build_model(arch, num_classes=6, width=w, aux=False, instance=ins)
+        arch = arch + ("+inst" if ins else "")
         acts = [peak_activation_bytes(m, (s, s)) / 2 ** 20 for s in (256, 320, 640)]
         line = f"{arch:<11}{w:>6}{count_params(m):>10,d}{count_flops(m, (640, 640)):>11.3f}   " + " / ".join(f"{a:.2f}" for a in acts)
-        if arch == "nano":
+        if arch == "nano":            # plain nano only (instance head needs full-res output)
             m.output_stride = 8
             line += "   | stride-8 output @640: %.2f" % (peak_activation_bytes(m, (640, 640)) / 2 ** 20)
         print(line)
