@@ -95,9 +95,16 @@ from dataset import load_names, find_split_dir                                  
 
 
 def run(cmd):
-    """Run an agriseg script and stream its output."""
-    print('$', ' '.join(map(str, cmd)))
-    subprocess.run([sys.executable, *map(str, cmd)], cwd=AGRISEG_DIR, check=True)
+    """Run an agriseg script and stream its output into the notebook as it runs
+    (a plain subprocess.run prints to Colab's background log, not to the cell)."""
+    cmd = [sys.executable, '-u', *map(str, cmd)]
+    print('$', ' '.join(cmd[2:]), flush=True)
+    p = subprocess.Popen(cmd, cwd=AGRISEG_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, bufsize=1)
+    for line in p.stdout:
+        print(line, end='', flush=True)
+    if p.wait() != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd)
 
 
 # %%
