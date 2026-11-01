@@ -189,8 +189,9 @@ def count_params(model: nn.Module, include_aux: bool = False) -> int:
 
 def count_flops(model: nn.Module, imgsz=(512, 512), device="cpu") -> float:
     """Returns GMACs for one forward pass (aux head excluded because eval() drops it)."""
+    import copy
     from torch.utils.flop_counter import FlopCounterMode
-    model = model.eval().to(device)
+    model = copy.deepcopy(model).eval().to(device)   # copy: never move the caller's model off its device
     x = torch.zeros(1, 3, *imgsz, device=device)
     with torch.no_grad(), FlopCounterMode(display=False) as fc:
         model(x)
