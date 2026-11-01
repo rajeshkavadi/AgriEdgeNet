@@ -30,8 +30,8 @@ from pathlib import Path
 
 IN_COLAB = 'google.colab' in sys.modules
 if IN_COLAB:
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'roboflow', 'onnx', 'onnxruntime', 'onnxscript'],
-                   check=True)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'roboflow', 'ultralytics', 'onnx', 'onnxruntime',
+                    'onnxscript', 'onnxslim'], check=True)
 
 import numpy as np
 import cv2
