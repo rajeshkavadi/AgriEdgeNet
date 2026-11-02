@@ -54,6 +54,55 @@ def band_label(ax, y, text, color):
     ax.text(0.35, y, text, fontsize=11, fontweight="bold", color=color, rotation=90, va="center", ha="center")
 
 
+# ======================================================================= NANO (as evaluated on 1 Nov: no boundary head)
+fig, ax = fig_canvas("AgriSegNet-Nano",
+                     "34,742 parameters  |  0.25 GMACs @ 640x640  |  semantic segmentation  |  "
+                     "ops: Conv, depthwise Conv, Add, Mul, Clip (ReLU6), GlobalAvgPool, Sigmoid, Resize")
+w, h, y0 = 2.2, 1.55, 6.05
+band_label(ax, y0 + h / 2, "ENCODER", NANO)
+xs = [0.7, 3.15, 5.6, 8.05, 10.5, 12.95]
+inp = box(ax, xs[0], y0, w, h, "Input", ["RGB 3 x 640 x 640", "resize long side, pad /32"], DK, GREY_L)
+stem = box(ax, xs[1], y0, w, h, "Stem  1/2", ["Conv 3x3 s2, BN, ReLU6", "16 x 320 x 320", "464 params"], NANO, NANO_L)
+s4 = box(ax, xs[2], y0, w, h, "Stage 1/4", ["DW-sep s2 + InvRes(e=2)", "24 x 160 x 160", "3,584 params"], NANO, NANO_L)
+s8 = box(ax, xs[3], y0, w, h, "Stage 1/8", ["InvRes s2 + InvRes", "32 x 80 x 80", "8,368 params"], NANO, NANO_L)
+s16 = box(ax, xs[4], y0, w, h, "Stage 1/16", ["InvRes s2 + DW block", "48 x 40 x 40", "8,976 params"], NANO, NANO_L)
+s32 = box(ax, xs[5], y0, w, h, "Stage 1/32", ["DW-sep s2 + DW block", "48 x 20 x 20", "5,856 params"], NANO, NANO_L)
+for a_, b_ in [(inp, stem), (stem, s4), (s4, s8), (s8, s16), (s16, s32)]:
+    arrow(ax, R(a_), L(b_))
+
+y1 = 3.75
+band_label(ax, y1 + h / 2, "CONTEXT + DECODER", GRN)
+gate = box(ax, 12.95, y1, w, h, "Global context", ["GAP -> 1x1 -> sigmoid gate", "1x1 conv on f32 (32 ch)", "3,168 params"], GRN, GRN_L)
+fuse = box(ax, 10.5, y1, w, h, "Context fusion 1/16", ["1x1(f16) x gate", "+ upsample x2 (f32)", "32 x 40 x 40  |  1,600"], GRN, GRN_L)
+dec = box(ax, 8.05, y1, w, h, "Decoder 1/8", ["up x2 + 1x1 skip (f8)", "DW block -> 1x1 head", "6 x 80 x 80  |  2,726"], GRN, GRN_L)
+arrow(ax, B(s32), T(gate), label="f32")
+arrow(ax, B(s16), T(fuse), label="f16")
+arrow(ax, L(gate), R(fuse))
+arrow(ax, L(fuse), R(dec))
+arrow(ax, B(s8), T(dec), label="f8")
+
+y2 = 1.25
+band_label(ax, y2 + h / 2, "OUTPUT", DK)
+cls = box(ax, 8.05, y2, w, h, "Class logits", ["upsample x8 (bilinear)", "6 x 640 x 640", "background + 5 crops"], GRN, "#FFFFFF")
+lab = box(ax, 5.6, y2, w, h, "Label map", ["argmax per pixel", "1 x 640 x 640", "0 = background, 1-5 = crop"], DK, GREY_L)
+pat = box(ax, 3.15, y2, w, h, "Patches (CPU)", ["connected regions per crop", "area (m2) = pixels x GSD2", "mean GLI per patch"], DK, GREY_L)
+arrow(ax, B(dec), T(cls))
+arrow(ax, L(cls), R(lab))
+arrow(ax, L(lab), R(pat))
+
+ax.add_patch(FancyBboxPatch((10.5, 0.55), 4.65, 2.35, boxstyle="round,pad=0.02,rounding_size=0.12", linewidth=1.0,
+                            edgecolor="#C9D2C5", facecolor="#FAFBF9"))
+rows = [("Parameters by part", ""), ("Encoder", "27,248"), ("Context", "4,768"), ("Decoder + class head", "2,726"),
+        ("Total", "34,742")]
+for i, (k, v) in enumerate(rows):
+    bold = i in (0, len(rows) - 1)
+    ax.text(10.75, 2.6 - i * 0.42, k, fontsize=11, color=TXT, fontweight="bold" if bold else "normal", va="center")
+    ax.text(14.95, 2.6 - i * 0.42, v, fontsize=11, color=TXT, fontweight="bold" if bold else "normal", va="center", ha="right")
+ax.text(0.35, 0.3, "InvRes = inverted residual (1x1 expand x2, depthwise 3x3, 1x1 project); DW block = depthwise 3x3 + pointwise 1x1, "
+        "residual; DW-sep s2 = depthwise 3x3 stride 2 + pointwise. BN is folded into the convolutions at export.",
+        fontsize=9.5, color=MUT, va="center")
+fig.savefig(f"{OUT}/nano_architecture.png"); fig.savefig(f"{OUT}/nano_architecture.svg"); plt.close(fig)
+
 # ======================================================================= NANO
 fig, ax = fig_canvas("AgriSegNet-Nano with field-boundary head",
                      "37,047 parameters  |  0.30 GMACs @ 640x640  |  bottom-up instance segmentation  |  "
@@ -105,7 +154,7 @@ for i, (k, v) in enumerate(rows):
 ax.text(0.35, 0.3, "InvRes = inverted residual (1x1 expand x2, depthwise 3x3, 1x1 project); DW block = depthwise 3x3 + pointwise 1x1, "
         "residual; DW-sep s2 = depthwise 3x3 stride 2 + pointwise. BN is folded into the convolutions at export.",
         fontsize=9.5, color=MUT, va="center")
-fig.savefig(f"{OUT}/nano_architecture.png"); fig.savefig(f"{OUT}/nano_architecture.svg"); plt.close(fig)
+fig.savefig(f"{OUT}/nano_boundary_head_architecture.png"); fig.savefig(f"{OUT}/nano_boundary_head_architecture.svg"); plt.close(fig)
 
 # ======================================================================= YOLO26n-seg
 fig, ax = fig_canvas("YOLO26n-seg (baseline)",
