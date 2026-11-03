@@ -335,7 +335,7 @@ For each band, the transform of every capture is compared with the median transf
 For each capture, the median over **all valid pixels in the frame**: vegetation, road, shadow. They describe the scene, not a crop. The median is used rather than the mean because it is not pulled around by edge pixels or the few extreme values from shadows and mixed pixels.
 
 **B4. Should NDRE be greater than NDVI?**
-No. For vegetation NDRE is **always lower** than NDVI: leaves reflect much more red-edge than red, so (NIR − REG)/(NIR + REG) is smaller than (NIR − RED)/(NIR + RED). An earlier statement suggesting otherwise was wrong. The pipeline counts NDRE > NDVI on vegetation as an error indicator (≤ 0.21% of pixels here).
+No. For vegetation NDRE is **always lower** than NDVI: leaves reflect much more red-edge than red, so (NIR − REG)/(NIR + REG) is smaller than (NIR − RED)/(NIR + RED). Any statement that NDRE should exceed NDVI for vegetation is wrong. The pipeline counts NDRE > NDVI on vegetation as an error indicator (≤ 0.21% of pixels here).
 
 **B5. Capture 0064 has a higher NDRE median (0.08) than the others (0.03–0.05). Is that a contradiction?**
 No. The rule is NDRE < NDVI **within a pixel or a capture**; 0064 obeys it (NDRE 0.08 vs NDVI 0.66). Comparing *across* captures, 0064 has higher NDVI as well as higher NDRE. Two causes are possible:
