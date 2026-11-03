@@ -22,6 +22,8 @@ Numbers quoted are from the 12-image flight (`IMG_260707_*`, 4 captures x NIR/RE
 **What the outputs are:** illumination-normalised, sensor-calibrated indices, valid for **relative comparison within this flight**.
 **What they are not:** reflectance-based indices; they cannot be compared directly with other flights, other sensors or published thresholds.
 
+Background on the three data levels (raw, radiance, reflectance) is in **Appendix A**. Answers to the specific questions raised during review of this notebook are in **Appendix B**.
+
 ---
 
 ## 1. Why NDVI and NDRE
@@ -266,3 +268,136 @@ The residual check is the one that supports the claim **"sub-pixel alignment, wo
 | `alignment_summary.csv` | per band and capture: method, ECC score, NCC before/after, centre shift, deviation from flight median, homography |
 | `indices_summary.csv` | per capture: processing level, valid area, NDVI/NDRE mean, median, 5th and 95th percentiles, class shares |
 | `PROCESSING_REPORT.txt` | settings and per-capture summary in plain text |
+
+---
+
+## Appendix A. Raw, radiance and reflectance: where our data sits
+
+Adapted from Resonon, *"Raw, Radiance, and Reflectance Hyperspectral Data"* (resonon.com/blog-raw-radiance-reflectance-hyperspectral-data). The article is written for hyperspectral imagers, but the same three levels apply to any calibrated multispectral camera, including the Sequoia.
+
+### A.1 What a pixel records
+
+Simplified, a pixel's raw value is the product of three things:
+
+$$\mathrm{DN}(\lambda) \approx \underbrace{E(\lambda)}_{\text{illumination}} \times \underbrace{\rho(\lambda)}_{\text{surface reflectance}} \times \underbrace{H(\lambda)}_{\text{sensor response}} \;+\; \text{dark signal}$$
+
+Only ρ is a property of the crop. Each calibration step strips away one of the other terms:
+
+* dark subtraction removes the dark signal;
+* radiometric calibration removes H (the sensor);
+* the reflectance step removes E (the light).
+
+### A.2 The three levels
+
+| Level | Units | Contains | Comparable across | Resonon's use case |
+|---|---|---|---|---|
+| **Raw** (DN, "counts") | none; instrument-specific | illumination x reflectance x sensor response + dark | nothing; not even the same camera under different settings | keep for reprocessing |
+| **Radiance** | physical (Resonon: µW sr⁻¹ cm⁻² µm⁻¹) | illumination x reflectance (and atmosphere) | different sensors, same moment | energy budgets, atmospheric work, sensor comparison |
+| **Reflectance** | unitless, 0–1 | the surface only | different times, light, sensors | material identification, agriculture, comparison across conditions |
+
+### A.3 Mapping the Sequoia pipeline onto these levels
+
+| Resonon step | Resonon formula | Sequoia equivalent in our pipeline | Difference |
+|---|---|---|---|
+| Dark correction | Raw − Dark | DN − B (B from XMP `SensorModel`) | none in principle; Sequoia stores B per image instead of a separate dark frame |
+| Radiometric calibration | (Raw − Dark) x pixel-by-pixel gain, from a lab calibration file specific to camera + lens | f² / (A·t·ISO + C) for the gain, / V(x,y) for the per-pixel part (vignetting) | Resonon's gain is **traceable to absolute units**; Parrot's A, C and V produce **arbitrary units**. The shape matches radiance, the units don't, hence "radiance-like" or "pseudo-radiance". |
+| Reflectance (bench) | (Raw − Dark) / (White − Dark) | — | not applicable outdoors |
+| Reflectance (field) | calibration tarp of known reflectance in the scene | **reflectance panel**: K·E = I_panel / ρ_panel (`PANEL` option) | identical idea; not available for this flight |
+| Reflectance (airborne) | downwelling irradiance sensor + instrument calibration | **Sunshine sensor** + factory per-band calibration fields | Resonon: "combined with instrument calibration data". That combination is the K factor we lack in absolute terms (section 7). |
+
+**Where our outputs sit:** above raw and close to radiance, but in arbitrary units, with relative illumination correction within the flight. They are **not reflectance**. In Resonon's terms we have done steps 1 and 2 (without absolute units), plus a relative version of the airborne step 3.
+
+### A.4 Points from the article that apply to us
+
+1. **Keep raw data.** The pipeline never overwrites the original TIFs; all outputs go to `Sequoia_Indices/`, so reprocessing (e.g. once a panel is available) is always possible.
+2. **Saturation.** A raw value stuck at the sensor maximum carries no information, and any index computed from it is wrong.
+   * The Sequoia TIFs store 10-bit data scaled into 16-bit (all values are multiples of 64, so the ceiling is 1023 x 64 = 65,472).
+   * In our 12 images the brightest pixel is 53,376 (REG, i.e. 834 of 1023). **No pixel is saturated.**
+   * The pipeline does not yet mask saturated pixels. That needs adding before flights over bright targets (panels, bare dry soil, specular water).
+3. **Calibration is camera-specific.** Resonon's calibration file belongs to one camera + lens. Equivalently, the Sequoia's A, B, C, V and Sunshine calibration fields belong to this unit. They are read **per image** from XMP, never copied from another camera or hard-coded.
+4. **Bench formula vs field practice.** The bench formula (Raw − Dark)/(White − Dark) assumes the white reference was captured with the **same exposure** as the scene.
+   * The Sequoia sets exposure automatically, so a panel shot and a scene shot almost never share settings.
+   * Panel and scene must therefore both be converted to *I* first (dark, exposure, ISO, aperture, vignetting) before taking the ratio. Our `PANEL` code does this.
+   * Using raw DN ratios instead would build the exposure difference into every reflectance value.
+5. **Pick the level for the claim.** "Plot A is greener than plot B *in this flight*" is supported by our current level. "Plot A has NDVI 0.62, adequate nitrogen", or any comparison across dates or sensors, needs reflectance.
+
+---
+
+## Appendix B. Questions raised during review (notebook 2)
+
+**B1. What is the false-colour image, and why are all bands overlaid in one picture?**
+It is a QC image, not a photograph. NIR is shown in the red channel, RED in green, and REG in blue. If the bands are misaligned, edges show coloured fringes, because each colour channel puts the same edge in a different place. After registration the fringes should disappear. It is the quickest visual check that the bands now sit on one pixel grid. Vegetation appears red/orange because it is bright in NIR. (GRE is used in place of REG when present; this flight has no GRE.)
+
+**B2. What is "max deviation from median (px)"?**
+For each band, the transform of every capture is compared with the median transform of the flight: 4 corners + centre, largest displacement in pixels. Range here: 0.21–1.63 px. It measures **consistency between captures**, not accuracy: all four captures could share the same error and still score 0. Accuracy comes from the residual check (B11, section 8.1).
+
+**B3. What are the NDVI / NDRE medians in the table?**
+For each capture, the median over **all valid pixels in the frame**: vegetation, road, shadow. They describe the scene, not a crop. The median is used rather than the mean because it is not pulled around by edge pixels or the few extreme values from shadows and mixed pixels.
+
+**B4. Should NDRE be greater than NDVI?**
+No. For vegetation NDRE is **always lower** than NDVI: leaves reflect much more red-edge than red, so (NIR − REG)/(NIR + REG) is smaller than (NIR − RED)/(NIR + RED). An earlier statement suggesting otherwise was wrong. The pipeline counts NDRE > NDVI on vegetation as an error indicator (≤ 0.21% of pixels here).
+
+**B5. Capture 0064 has a higher NDRE median (0.08) than the others (0.03–0.05). Is that a contradiction?**
+No. The rule is NDRE < NDVI **within a pixel or a capture**; 0064 obeys it (NDRE 0.08 vs NDVI 0.66). Comparing *across* captures, 0064 has higher NDVI as well as higher NDRE. Two causes are possible:
+
+1. a larger share of vegetation in its footprint (the frames overlap but are not identical);
+2. a lighting effect not fully removed (e.g. Sunshine tilt, section 6.3).
+
+The present data cannot separate them. A per-pixel comparison on the overlapping area of the captures would.
+
+**B6. Where does the sensor model come from?**
+Parrot application note SEQ-AN-01 (*"Pixel value to irradiance using the sensor calibration model"*). The coefficients A, B, C are written into each image's XMP at capture.
+
+**B7. What is *I*?**
+The sensor-calibrated value: dark-subtracted, corrected for exposure/ISO/aperture and vignetting. It is proportional to the radiance leaving the scene, in Parrot's arbitrary units (section 3, A.3).
+
+**B8. What is the "golden reference" in the Sunshine calibration fields?**
+Each band's Sunshine data carries calibration values that differ between bands but are **identical in all four captures**. That pattern fits factory constants: this unit's Sunshine and camera cross-calibrated against a Parrot reference ("golden") unit. They do not measure the flight's light.
+
+* They cancel in our flight-relative normalisation (each band is divided by its own flight median).
+* They are what the Sunshine-only reflectance route would use (section 7).
+
+**B9. Irradiance vs reflectance, and why normalise to the median?**
+Irradiance is the light **arriving** (Sunshine sensor). Radiance or *I* is the light **leaving** the scene (camera). Reflectance is their ratio.
+
+Normalising to the flight **median** irradiance puts every capture "under typical light for this flight". The median is used because:
+
+* any single capture chosen as reference could itself be the odd one (a passing cloud);
+* the median is unaffected by one outlier.
+
+**B10. What is in XMP vs EXIF?**
+
+* **EXIF** is the standard camera block: exposure time, ISO, f-number, timestamps, GPS.
+* **XMP** is Parrot's extension block: band name, `SensorModel` (A, B, C), the vignetting polynomial, camera orientation, `IrradianceList` (Sunshine log), `CalibrationPicture`, `InvalidPixel`, and capture/flight IDs.
+
+Both are needed: exposure settings from EXIF, sensor model and vignetting from XMP.
+
+**B11. How do we know the final alignment is within ~1.3 px?**
+Not from the ECC score, and not from consistency with the flight median (B2). After warping, each image is cut into a 3x3 grid of patches, and phase correlation measures the remaining shift of RED and NIR against REG in each patch.
+
+* NIR: median 0.39 px, max 1.03 px.
+* RED: median 0.36 px, max 1.33 px, over 31 of 36 patches; 5 patches had too little texture to measure.
+
+This is the evidence for "sub-pixel typical, worst case ~1.3 px" (section 8.1). The check is a separate script and should be added to the notebook.
+
+**B12. Why weren't indices computed from reflectance?**
+There is no panel image in this flight (`CalibrationPicture = 0` on all 12 TIFs), and the metadata does not give the absolute per-band factor K. Reflectance is possible with a panel (supported in code) or approximately via the Sunshine sensor (not implemented). See section 7 and A.3.
+
+**B13. We have the band sensitivity A. Isn't that enough for reflectance?**
+No. A converts DN into *I* (the camera side only). Reflectance also needs the light **arriving**, per band, in the same units (K·E). A is a fixed factory number and says nothing about the sun's spectrum or that day's light.
+
+**B14. *I* is dark-current corrected. Why isn't it reflectance, and why "pseudo-radiance"?**
+Dark subtraction sets the **zero point**, not the **scale**. Reflectance is light leaving ÷ light arriving. *I* holds only the light leaving, so it changes with time of day while reflectance does not.
+
+"Pseudo-radiance" because *I* is proportional to radiance but in arbitrary units: Parrot gives no conversion to W·m⁻²·sr⁻¹·nm⁻¹ (section 3, A.3).
+
+**B15. Is radiometric calibration just the Sunshine lighting correction?**
+No. Our calibration is four steps:
+
+1. sensor model;
+2. vignetting;
+3. Sunshine illumination normalisation (relative, within the flight);
+4. reflectance conversion: **not done**.
+
+The Sunshine step is only the third. Section 0 has the full table; section 6.3 lists what the Sunshine step does not correct.
+
